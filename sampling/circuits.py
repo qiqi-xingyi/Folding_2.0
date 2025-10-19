@@ -9,14 +9,12 @@ import numpy as np
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import SparsePauliOp
 
-# EfficientSU2 import path compatibility (2.x vs 1.x)
+# EfficientSU2 import (Qiskit 2.x primary; keep fallback for safety)
 try:
     from qiskit.circuit.library import EfficientSU2
 except Exception:
-    # Older path (unlikely needed, but kept as guard)
     from qiskit.circuit.library.n_local import EfficientSU2  # type: ignore
 
-# Pauli evolution (paths are stable across 1.x/2.x)
 from qiskit.circuit.library import PauliEvolutionGate
 from qiskit.synthesis import SuzukiTrotter
 
@@ -47,10 +45,22 @@ def make_sampling_circuit(
     entanglement: str = "linear",
     trotter: int = 1
 ) -> QuantumCircuit:
+    # Build parametric ansatz
     ans = build_ansatz(n_qubits, reps=reps, entanglement=entanglement)
+
+    # Prepare parameter mapping using the ansatz's own parameter order
+    param_list = list(ans.parameters)  # preserves insertion order in Qiskit 2.x
+    if len(param_list) != len(params):
+        raise ValueError(f"Parameter size mismatch: expected {len(param_list)}, got {len(params)}")
+    mapping = {p: float(v) for p, v in zip(param_list, params)}
+
+    # Compose ansatz, then assign parameters on the composed circuit
     circ = QuantumCircuit(n_qubits)
-    circ.compose(ans.bind_parameters(params), inplace=True)
-    apply_beta_layer(circ, H, beta, trotter=trotter)
+    circ.compose(ans, inplace=True)
+    circ = circ.assign_parameters(mapping, inplace=False)
+
+    # Optional beta evolution and measurement
+    circ = apply_beta_layer(circ, H, beta, trotter=trotter)
     circ.measure_all()
     return circ
 
