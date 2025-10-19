@@ -45,22 +45,28 @@ def make_sampling_circuit(
     entanglement: str = "linear",
     trotter: int = 1
 ) -> QuantumCircuit:
-    # Build parametric ansatz
     ans = build_ansatz(n_qubits, reps=reps, entanglement=entanglement)
 
-    # Prepare parameter mapping using the ansatz's own parameter order
-    param_list = list(ans.parameters)  # preserves insertion order in Qiskit 2.x
+    # Map parameters
+    param_list = list(ans.parameters)
     if len(param_list) != len(params):
         raise ValueError(f"Parameter size mismatch: expected {len(param_list)}, got {len(params)}")
     mapping = {p: float(v) for p, v in zip(param_list, params)}
 
-    # Compose ansatz, then assign parameters on the composed circuit
+    # Compose and bind
     circ = QuantumCircuit(n_qubits)
     circ.compose(ans, inplace=True)
     circ = circ.assign_parameters(mapping, inplace=False)
 
-    # Optional beta evolution and measurement
+    # Decompose composite instructions (e.g., EfficientSU2) to basis gates
+    # A single call is usually enough; use reps>1 to be safe.
+    circ = circ.decompose(reps=3)
+
+    # Optional beta-evolution
     circ = apply_beta_layer(circ, H, beta, trotter=trotter)
+
+    # Final measurement
     circ.measure_all()
     return circ
+
 
