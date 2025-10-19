@@ -7,137 +7,103 @@
 from __future__ import annotations
 from typing import Dict, Optional
 import warnings
-import numpy as np
 
 from qiskit import QuantumCircuit
 
-# Prefer AerSampler if available
+# Preferred local simulator: Aer SamplerV2 (Qiskit 2.x)
 try:
-    from qiskit_aer.primitives import AerSampler
+    from qiskit_aer.primitives import SamplerV2 as AerSamplerV2
 except Exception:
-    AerSampler = None
+    AerSamplerV2 = None  # type: ignore
 
-# Fallback local primitives Sampler if present
-try:
-    from qiskit.primitives import Sampler as LocalSampler
-except Exception:
-    LocalSampler = None
-
-# Optional: statevector fallback
+# Optional statevector fallback
 try:
     from qiskit.quantum_info import Statevector
 except Exception:
-    Statevector = None
+    Statevector = None  # type: ignore
 
 
 class SamplerBackend:
     """Abstract base for a sampler backend producing measurement counts."""
-
-    def __init__(self, shots: int, seed: Optional[int] = None):
+    def __init__(self, shots: int):
         self.shots = int(shots)
-        self.seed = seed
 
     def run_counts(self, circuit: QuantumCircuit) -> Dict[str, int]:
         raise NotImplementedError
 
 
-def _normalize_probs_to_counts(probs: Dict[str, float], shots: int) -> Dict[str, int]:
-    counts = {b: int(round(max(0.0, float(p)) * shots)) for b, p in probs.items() if float(p) > 0.0}
-    drift = shots - sum(counts.values())
-    if drift != 0 and counts:
-        k = max(counts, key=counts.get)
-        counts[k] += drift
+def _normalize_counts_to_total(counts: Dict[str, int], shots: int) -> Dict[str, int]:
+    total = sum(counts.values())
+    if total == shots or not counts:
+        return counts
+    drift = shots - total
+    # Assign drift to the most frequent key
+    k = max(counts, key=counts.get)
+    counts[k] += drift
     return counts
 
 
-def _extract_probabilities(result) -> Dict[str, float]:
+def _extract_counts_v2(result) -> Dict[str, int]:
     """
-    Robust probability extraction supporting Qiskit 2.x and 1.x result layouts.
-    Tries (in order):
-      - result.quasi_dists[0]            (2.x AerSampler)
-      - result[0].quasi_dist             (2.x per-result)
-      - result[0].data.meas.get_probabilities()  (1.x path)
-      - result[0].data.meas.get_counts() -> normalize to probs
+    Qiskit 2.x result path:
+      result[0].data.meas.get_counts()
+    Fallbacks try probabilities if needed.
     """
-    # 2.x aggregated quasi_dists
+    # Primary: counts
     try:
-        qd = result.quasi_dists[0]
-        # qd can be dict or QuasiDistribution
-        return dict(qd)
+        return dict(result[0].data.meas.get_counts())
     except Exception:
         pass
-
-    # 2.x per-result quasi_dist
+    # Fallback: probabilities -> counts
     try:
-        qd = result[0].quasi_dist
-        return dict(qd)  # may already be a dict-like
-    except Exception:
-        pass
-
-    # 1.x probabilities API
-    try:
-        probs = result[0].data.meas.get_probabilities()
-        return dict(probs)
-    except Exception:
-        pass
-
-    # 1.x counts API -> normalize
-    try:
-        counts = result[0].data.meas.get_counts()
-        total = float(sum(counts.values())) or 1.0
-        return {k: v / total for k, v in counts.items()}
+        probs = dict(result[0].data.meas.get_probabilities())
+        counts = {b: int(round(float(p) * 1_000_000)) for b, p in probs.items() if float(p) > 0.0}
+        return counts
     except Exception as e:
-        raise RuntimeError(f"Unrecognized sampler result format: {e}") from e
+        raise RuntimeError(f"Unrecognized SamplerV2 result format: {e}") from e
 
 
 class LocalSimulatorBackend(SamplerBackend):
     """
-    Local simulator backend:
-      - Prefer qiskit_aer.primitives.AerSampler (2.x)
-      - Fallback to qiskit.primitives.Sampler
-      - Fallback to statevector (if both missing)
+    Local simulator using qiskit_aer.primitives.SamplerV2 (Qiskit 2.x).
+    Falls back to Statevector if Aer is not available.
     """
 
     def __init__(self, shots: int, seed: Optional[int] = None):
-        super().__init__(shots, seed)
+        super().__init__(shots)
+        self.seed = seed
+        self._mode = None  # "aer" | "statevector"
         self._sampler = None
-        self._mode = None  # "aer" | "local" | "statevector"
 
-        if AerSampler is not None:
-            # Qiskit 2.x: do not pass options in ctor; provide in run()
-            self._sampler = AerSampler()
+        if AerSamplerV2 is not None:
+            self._sampler = AerSamplerV2()
             self._mode = "aer"
-        elif LocalSampler is not None:
-            warnings.warn(
-                "qiskit-aer not found; falling back to qiskit.primitives.Sampler "
-                "(probabilities will be converted to counts)."
-            )
-            self._sampler = LocalSampler()
-            self._mode = "local"
         elif Statevector is not None:
             warnings.warn(
-                "No local sampler available; falling back to Statevector-based sampling."
+                "No local SamplerV2 available; falling back to Statevector-based sampling."
             )
             self._mode = "statevector"
         else:
             raise RuntimeError(
-                "No local simulation path available. Install qiskit-aer or ensure primitives are present."
+                "No local simulation path available. Install qiskit-aer for SamplerV2."
             )
+
+        print(f"[LocalSimulatorBackend] mode = {self._mode}")
 
     def run_counts(self, circuit: QuantumCircuit) -> Dict[str, int]:
         if self._mode == "statevector":
-            # Remove final measurements for pure statevector evolution
-            unitary_circ = self._strip_final_measurements(circuit)
-            sv = Statevector.from_instruction(unitary_circ)
-            probs_dict = sv.probabilities_dict()
-            return _normalize_probs_to_counts(probs_dict, self.shots)
+            unitary = self._strip_final_measurements(circuit)
+            sv = Statevector.from_instruction(unitary)
+            probs = sv.probabilities_dict()
+            counts = {b: int(round(float(p) * self.shots)) for b, p in probs.items() if float(p) > 0.0}
+            return _normalize_counts_to_total(counts, self.shots)
 
-        # AerSampler / LocalSampler path (2.x or 1.x)
-        # Provide run_options at call time (2.x style). 1.x ignores unknown kwargs gracefully.
-        job = self._sampler.run([circuit], run_options={"shots": self.shots, "seed_simulator": self.seed})
+        # Aer SamplerV2 path
+        job = self._sampler.run([circuit], shots=self.shots)  # seed is not guaranteed/supported here
         res = job.result()
-        probs = _extract_probabilities(res)
-        return _normalize_probs_to_counts(probs, self.shots)
+        counts = _extract_counts_v2(res)
+        # Counts from Aer are already integer; align to requested shots just in case
+        return _normalize_counts_to_total(counts, self.shots)
 
     @staticmethod
     def _strip_final_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
@@ -153,25 +119,23 @@ class LocalSimulatorBackend(SamplerBackend):
 
 
 class IBMSamplerBackend(SamplerBackend):
-    """IBM Runtime SamplerV2 (2.x 可用；1.x 也兼容)."""
+    """IBM Runtime SamplerV2 (Qiskit 2.x)."""
 
-    def __init__(self, shots: int, backend_name: Optional[str], seed: Optional[int] = None):
-        super().__init__(shots, seed)
+    def __init__(self, shots: int, backend_name: Optional[str]):
+        super().__init__(shots)
         try:
-            from qiskit_ibm_runtime import SamplerV2 as IBMSampler
+            from qiskit_ibm_runtime import SamplerV2 as IBMSamplerV2
         except Exception as e:
-            raise RuntimeError(
-                "qiskit-ibm-runtime must be installed to use IBM backends."
-            ) from e
+            raise RuntimeError("qiskit-ibm-runtime must be installed to use IBM backends.") from e
 
-        # For SamplerV2, pass default shots in options; seed is not guaranteed to be honored on HW.
-        self._sampler = IBMSampler(session=None, options={"default_shots": shots, "backend": backend_name})
+        # default_shots in options sets the runtime default; run() can also pass shots explicitly
+        self._sampler = IBMSamplerV2(session=None, options={"default_shots": shots, "backend": backend_name})
 
     def run_counts(self, circuit: QuantumCircuit) -> Dict[str, int]:
-        job = self._sampler.run([circuit])
+        job = self._sampler.run([circuit], shots=self.shots)
         res = job.result()
-        probs = _extract_probabilities(res)
-        return _normalize_probs_to_counts(probs, self.shots)
+        counts = _extract_counts_v2(res)
+        return _normalize_counts_to_total(counts, self.shots)
 
 
 def make_backend(kind: str, shots: int, seed_sim: Optional[int], ibm_backend: Optional[str]) -> SamplerBackend:
@@ -179,7 +143,7 @@ def make_backend(kind: str, shots: int, seed_sim: Optional[int], ibm_backend: Op
     if kind == "simulator":
         return LocalSimulatorBackend(shots=shots, seed=seed_sim)
     elif kind == "ibm":
-        return IBMSamplerBackend(shots=shots, backend_name=ibm_backend, seed=seed_sim)
+        return IBMSamplerBackend(shots=shots, backend_name=ibm_backend)
     else:
         raise ValueError(f"Unknown backend kind: {kind}")
 
