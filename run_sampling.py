@@ -10,7 +10,7 @@ from sampling import SamplingRunner, SamplingConfig, BackendConfig
 # ---------------------------------------------------------------------
 # Example 1 — use a simple dummy Hamiltonian (for local testing)
 # ---------------------------------------------------------------------
-def demo_hamiltonian(n_qubits: int = 2) -> SparsePauliOp:
+def demo_hamiltonian(n_qubits: int = 8) -> SparsePauliOp:
     """Example Hamiltonian: H = Z0 + Z1."""
     paulis = []
     coeffs = []
@@ -28,7 +28,7 @@ if __name__ == "__main__":
     # Configuration
     # --------------------------------------------------------------
     cfg = SamplingConfig(
-        L=2,
+        L=5,
         betas=[0.0, 0.5, 1.0],
         seeds=4,
         reps=1,
@@ -42,7 +42,7 @@ if __name__ == "__main__":
     # --------------------------------------------------------------
     # Hamiltonian (replace this with your real one)
     # --------------------------------------------------------------
-    H = demo_hamiltonian(2)
+    H = demo_hamiltonian(6)
 
     # --------------------------------------------------------------
     # Run the sampling
