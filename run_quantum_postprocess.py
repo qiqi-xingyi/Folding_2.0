@@ -4,7 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:run_quantum_postprocess.py
 
-
 """
 IDE-friendly top-level script for QSADPP post-processing.
 
