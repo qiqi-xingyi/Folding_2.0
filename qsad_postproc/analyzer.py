@@ -14,6 +14,7 @@ import pandas as pd
 from .config import AnalyzerConfig
 from .metrics import shannon_entropy, effective_sample_size
 from .utils import bitstrings_to_array, pairwise_hamming
+from qsad_postproc.utils import bitstrings_to_array, normalize_bitstrings
 
 def _weighted_mode(bitstrings: List[str], probs: np.ndarray) -> str:
     idx = int(np.argmax(probs))
@@ -75,7 +76,9 @@ class SamplingAnalyzer:
                 "top_prob": probs[top_idx],
             })
 
-        out = self.df.groupby(gkeys, dropna=False).apply(_summ).reset_index()
+        # out = self.df.groupby(gkeys, dropna=False).apply(_summ).reset_index()
+        out = self.df.groupby(gkeys, dropna=False).apply(_summ, include_groups=False).reset_index()
+
         return out
 
     def per_group_aggregate(self, agg: str = "mean") -> pd.DataFrame:
@@ -103,7 +106,18 @@ class SamplingAnalyzer:
                 continue
             probs = probs / total
 
-            A = bitstrings_to_array(bitstrings)  # (N, L)
+            # decide target length for this group
+            if "n_qubits" in grp.columns:
+                L = int(grp["n_qubits"].iloc[0])
+            elif self.cfg.n_qubits is not None:
+                L = int(self.cfg.n_qubits)
+            else:
+                L = max(len(s) for s in bitstrings)
+
+            if self.cfg.normalize_bitstrings:
+                bitstrings = normalize_bitstrings(bitstrings, target_len=L)
+
+            A = bitstrings_to_array(bitstrings)
             p1 = (probs[:, None] * A).sum(axis=0)
             base = {k: grp.iloc[0][k] for k in gkeys}
             for q, val in enumerate(p1):
@@ -133,10 +147,22 @@ class SamplingAnalyzer:
                 continue
             probs = probs / total
 
-            mode = _weighted_mode(bitstrings, probs)
+            if "n_qubits" in grp.columns:
+                L = int(grp["n_qubits"].iloc[0])
+            elif self.cfg.n_qubits is not None:
+                L = int(self.cfg.n_qubits)
+            else:
+                L = max(len(s) for s in bitstrings)
+
+            if self.cfg.normalize_bitstrings:
+                bitstrings = normalize_bitstrings(bitstrings, target_len=L)
+
+            mode_idx = int(np.argmax(probs))
+            mode = bitstrings[mode_idx]
             arr = bitstrings_to_array(bitstrings)
             mode_arr = bitstrings_to_array([mode])[0]
             hamm = float(np.sum(probs * np.sum(arr != mode_arr, axis=1)))
+
             base = {k: grp.iloc[0][k] for k in gkeys}
             rows.append({**base, "mode": mode, "mean_hamming_to_mode": hamm})
         return pd.DataFrame(rows)
