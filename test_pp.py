@@ -49,8 +49,9 @@ def build_problem(meta):
     return MockProteinFoldingProblem(meta["sequence"])
 
 def get_side_chain_hot_vector(meta):
-    # fake side-chain presence flags
-    return [i % 2 == 0 for i in meta["sequence"]]
+    seq = meta["sequence"]
+    return [False for _ in seq]
+
 
 def get_fifth_bit_flag(meta):
     return True  # simplified assumption
