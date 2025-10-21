@@ -19,12 +19,27 @@ from Protein_Folding.penalty_parameters import PenaltyParameters
 from Protein_Folding.protein_folding_problem import ProteinFoldingProblem
 
 
-# =====================================================
-# Global parameters (edit freely)
-# =====================================================
-IBM_TOKEN: str = os.getenv("IBM_QUANTUM_TOKEN", "")
-IBM_TOKEN_FILE: str = ""
-IBM_BACKEND_NAME: str | None = None
+IBM_CONFIG_FILE = "./ibm_config.txt"
+
+def read_ibm_config(path: str) -> Dict[str, str]:
+    """Read IBM Quantum credentials (TOKEN, INSTANCE, BACKEND) from a simple config file."""
+    cfg: Dict[str, str] = {}
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                if "=" not in line:
+                    continue
+                key, value = line.strip().split("=", 1)
+                cfg[key.strip().upper()] = value.strip()
+    except Exception as e:
+        print(f"Failed to read IBM config: {e}")
+    return cfg
+
+cfg_data = read_ibm_config(IBM_CONFIG_FILE)
+IBM_TOKEN = cfg_data.get("TOKEN", "")
+IBM_INSTANCE = cfg_data.get("INSTANCE", None)
+IBM_BACKEND_NAME = cfg_data.get("BACKEND", None)
+
 
 PENALTY_PARAMS = (10, 10, 10)
 BETA_LIST: List[float] = [0.0, 0.5, 1.0]
@@ -44,36 +59,18 @@ EXAMPLES: List[Dict[str, Any]] = [
 ]
 
 
-# =====================================================
-# Helpers
-# =====================================================
-def read_token_file(path: str) -> str | None:
-    if not path:
-        return None
-    try:
-        with open(path, "r") as f:
-            for line in f:
-                if "=" in line:
-                    key, value = line.strip().split("=", 1)
-                    if key.strip().lower() in {"token", "ibm_quantum_token"}:
-                        return value.strip()
-    except Exception:
-        pass
-    return None
-
-
 def init_ibm_service() -> QiskitRuntimeService:
-    token = IBM_TOKEN.strip()
-    if not token and IBM_TOKEN_FILE:
-        file_token = read_token_file(IBM_TOKEN_FILE)
-        if file_token:
-            token = file_token.strip()
-    if token:
+    if IBM_TOKEN:
         try:
-            return QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
+            return QiskitRuntimeService(
+                channel="ibm_quantum_platform",
+                token=IBM_TOKEN,
+                instance=IBM_INSTANCE
+            )
         except Exception:
             return QiskitRuntimeService()
     return QiskitRuntimeService()
+
 
 
 def build_protein_hamiltonian(sequence: str, penalties: tuple[int, int, int]) -> SparsePauliOp:
@@ -138,10 +135,6 @@ def per_example_sampling(protein_name: str, sequence: str) -> str:
         return merged_csv
     return ""
 
-
-# =====================================================
-# Main entry
-# =====================================================
 if __name__ == "__main__":
     service = init_ibm_service()
 
