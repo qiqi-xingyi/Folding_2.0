@@ -44,12 +44,16 @@ MJ_DEFAULT_TSV: str = (
 
 def _parse_mj_tsv(text: str) -> Dict[str, Dict[str, float]]:
     """
-    Parse a Miyazawa–Jernigan matrix from a TSV or whitespace-delimited text.
-    - Does NOT enforce a fixed AA20 order.
-    - Uses the file header as the column order and the first field of each row as the row amino acid.
-    - Returns a nested dict: table[row_aa][col_aa] = float value.
-    - Case-insensitive (converted to uppercase).
-    - Expects exactly 20 amino acids but allows any order.
+    Parse a Miyazawa–Jernigan matrix from whitespace/TSV text.
+
+    Supported formats:
+      - Header: 20 one-letter amino acids in any order.
+      - Data: 20 rows, each with 20 numeric values.
+        This may represent a full matrix or an upper-triangular matrix
+        (with zeros in the lower triangle). The parser will symmetrize
+        by mirroring the upper triangle to the lower triangle.
+
+    Returns a nested dict: table[row_aa][col_aa] = float
     """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
     if not lines:
@@ -65,35 +69,42 @@ def _parse_mj_tsv(text: str) -> Dict[str, Dict[str, float]]:
     if any(len(c) != 1 for c in cols):
         raise ValueError(f"Column labels must be one-letter amino acid codes, got: {cols}")
 
-    # Parse data rows
-    table: Dict[str, Dict[str, float]] = {}
-    seen_rows = set()
+    # Must have 20 data rows
+    if len(lines) - 1 != 20:
+        raise ValueError(f"Expected 20 data rows after the header, got {len(lines) - 1}")
+
+    # Parse numeric 20x20 matrix (unlabeled rows)
+    M = []
     for ln in lines[1:]:
         parts = ln.split()
-        if not parts:
-            continue
-        if len(parts) != 1 + len(cols):
-            raise ValueError(f"Row must have 1 + {len(cols)} fields (AA + values), got: {ln}")
-        row_aa = parts[0].upper()
-        if len(row_aa) != 1:
-            raise ValueError(f"Row AA label must be one-letter code, got: {row_aa}")
-        if row_aa in seen_rows:
-            raise ValueError(f"Duplicate row for amino acid: {row_aa}")
-        seen_rows.add(row_aa)
+        if len(parts) != 20:
+            raise ValueError(f"Row must have 20 numeric values, got: {ln}")
+        M.append([float(x) for x in parts])
+    import numpy as np  # local import to avoid hard dependency at module import
+    M = np.asarray(M, dtype=float)
+    if M.shape != (20, 20):
+        raise ValueError(f"Parsed matrix has wrong shape: {M.shape}")
 
-        vals = [float(x) for x in parts[1:]]
-        row = {c: float(v) for c, v in zip(cols, vals)}
-        table[row_aa] = row
+    # Symmetrize: assume values on/above diagonal are authoritative.
+    # Mirror M[i,j] to M[j,i] for i <= j. If lower triangle has non-zero conflicting
+    # entries, the upper-triangle value takes precedence.
+    for i in range(20):
+        for j in range(i, 20):
+            val = M[i, j]
+            M[j, i] = val
 
-    # Validate completeness
-    if len(table) != 20:
-        raise ValueError(f"MJ table must have 20 rows, got {len(table)} rows: {sorted(table.keys())}")
+    # Build nested dict table[row_aa][col_aa]
+    table: Dict[str, Dict[str, float]] = {aa: {} for aa in cols}
+    for i, ri in enumerate(cols):
+        for j, cj in enumerate(cols):
+            table[ri][cj] = float(M[i, j])
 
-    missing_cols = [aa for aa in table.keys() if aa not in cols]
-    if missing_cols:
-        raise ValueError(f"Column labels do not cover all row AAs. Missing in columns: {missing_cols}")
+    # Sanity check
+    if len(table) != 20 or any(len(row) != 20 for row in table.values()):
+        raise ValueError("MJ table is incomplete after parsing.")
 
     return table
+
 
 
 
