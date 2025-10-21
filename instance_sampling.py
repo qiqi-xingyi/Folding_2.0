@@ -1,4 +1,4 @@
-# --*-- conding:utf-8 --*--
+# --*-- coding:utf-8 --*--
 # @time:10/21/25 11:09
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
