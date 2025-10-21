@@ -27,7 +27,7 @@ from qsad_postproc.io import read_sampling_csv, write_many_csv
 # Configuration
 # ---------------------------------------------------------------------
 
-INPUT_FILE = "samples_demo.csv"
+INPUT_FILE = "Data/samples_demo.csv"
 OUT_DIR = Path("analysis")
 OUT_DIR.mkdir(exist_ok=True)
 OUT_PREFIX = OUT_DIR / "qsad_demo"
