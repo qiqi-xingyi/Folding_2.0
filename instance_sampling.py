@@ -17,7 +17,6 @@ from Protein_Folding.interactions.miyazawa_jernigan_interaction import MiyazawaJ
 from Protein_Folding.penalty_parameters import PenaltyParameters
 from Protein_Folding.protein_folding_problem import ProteinFoldingProblem
 
-
 IBM_CONFIG_FILE = "./ibm_config.txt"
 
 def read_ibm_config(path: str) -> Dict[str, str]:
