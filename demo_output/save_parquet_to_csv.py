@@ -25,7 +25,7 @@ from pathlib import Path
 def main():
     # ---- CONFIG ----
     # Change this to your actual Parquet file path
-    parquet_path = Path("./analysis/features.parquet")
+    parquet_path = Path("/Users/yuqizhang/Desktop/Code/SQD_Folding/demo_output/analysis/features.parquet")
     # ----------------
 
     if not parquet_path.exists():
