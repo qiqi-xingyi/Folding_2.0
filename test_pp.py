@@ -56,7 +56,6 @@ def get_side_chain_hot_vector(meta):
 def get_fifth_bit_flag(meta):
     return True  # simplified assumption
 
-
 # -----------------------------------------------------------------------------
 # 3. Create a fake sampling CSV
 # -----------------------------------------------------------------------------
