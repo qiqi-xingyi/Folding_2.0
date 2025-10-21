@@ -14,7 +14,6 @@ from .utils.protein_shape_decoder import ProteinShapeDecoder
 from .utils.protein_shape_file_gen import ProteinShapeFileGen
 
 
-
 if _optionals.HAS_MATPLOTLIB:
     # pylint: disable=import-error,unused-import
     from matplotlib.figure import Figure
