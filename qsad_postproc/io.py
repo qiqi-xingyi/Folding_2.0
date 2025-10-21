@@ -82,3 +82,14 @@ def read_sampling_csv(path: str, cfg: Optional[AnalyzerConfig] = None) -> pd.Dat
 
     return df
 
+def write_many_csv(dfs: Dict[str, pd.DataFrame], path_prefix: str) -> Dict[str, str]:
+    """
+    Write multiple DataFrames to CSV files with name pattern {prefix}_{key}.csv.
+    Returns mapping key -> path.
+    """
+    paths = {}
+    for key, df in dfs.items():
+        out = f"{path_prefix}_{key}.csv"
+        df.to_csv(out, index=False)
+        paths[key] = out
+    return paths

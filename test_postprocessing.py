@@ -20,7 +20,8 @@ import pandas as pd
 from pathlib import Path
 
 from qsad_postproc import SamplingAnalyzer, AnalyzerConfig
-from qsad_postproc.io import read_sampling_csv
+from qsad_postproc.io import read_sampling_csv, write_many_csv
+
 
 # ---------------------------------------------------------------------
 # Configuration
