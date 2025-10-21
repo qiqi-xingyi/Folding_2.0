@@ -6,7 +6,6 @@
 
 import os
 from typing import Dict, Any, List
-from pathlib import Path
 import pandas as pd
 
 from qiskit.quantum_info import SparsePauliOp
