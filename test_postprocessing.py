@@ -20,7 +20,7 @@ import pandas as pd
 from pathlib import Path
 
 from qsad_postproc import SamplingAnalyzer, AnalyzerConfig
-from qsad_postproc.io import write_many_csv
+from qsad_postproc.io import read_sampling_csv
 
 # ---------------------------------------------------------------------
 # Configuration
@@ -47,7 +47,10 @@ if __name__ == '__main__':
     if not os.path.exists(INPUT_FILE):
         raise FileNotFoundError(f"Cannot find file: {INPUT_FILE}")
 
-    df = pd.read_csv(INPUT_FILE)
+    df = read_sampling_csv(INPUT_FILE, cfg=AnalyzerConfig(
+        group_keys=("beta", "seed", "n_qubits", "label"),  # align with your schema
+        normalize_bitstrings=True,
+    ))
     print(f"  Loaded {len(df)} rows, columns = {list(df.columns)}")
 
     # ---------------------------------------------------------------------
