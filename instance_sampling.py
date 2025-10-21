@@ -23,22 +23,24 @@ from Protein_Folding.protein_folding_problem import ProteinFoldingProblem
 # Global parameters (edit freely)
 # =====================================================
 IBM_TOKEN: str = os.getenv("IBM_QUANTUM_TOKEN", "")
-IBM_TOKEN_FILE: str = ""  # optional: e.g., "./ibm_token.txt"
-IBM_BACKEND_NAME: str | None = None  # e.g., "ibm_cusco"; None -> least_busy()
+IBM_TOKEN_FILE: str = ""
+IBM_BACKEND_NAME: str | None = None
 
 PENALTY_PARAMS = (10, 10, 10)
 BETA_LIST: List[float] = [0.0, 0.5, 1.0]
 SEEDS: int = 4
 REPS: int = 1
 
-# 10 groups * 1000 shots = 20 000 total
+
 GROUP_COUNT = 10
-SHOTS_PER_GROUP = 1000
+SHOTS_PER_GROUP = 2000
 
 EXAMPLES: List[Dict[str, Any]] = [
-    {"protein_name": "6mu3_L_2", "main_chain_residue_seq": "YAGYS"},
-    {"protein_name": "4zb8", "main_chain_residue_seq": "YFASGQPYRYER"},
-    # add more here...
+    {"protein_name": "6mu3", "main_chain_residue_seq": "YAGYS"},
+    {"protein_name": "1ppi", "main_chain_residue_seq": "PWWERYQP"},
+    {"protein_name": "1m7y", "main_chain_residue_seq": "TAGATSANE"},
+    {"protein_name": "4f5y", "main_chain_residue_seq": "GLAWSYYIGYL"},
+    {"protein_name": "4zb8", "main_chain_residue_seq": "YFASGQPYRYER"}
 ]
 
 
@@ -68,7 +70,7 @@ def init_ibm_service() -> QiskitRuntimeService:
             token = file_token.strip()
     if token:
         try:
-            return QiskitRuntimeService(channel="ibm_quantum", token=token)
+            return QiskitRuntimeService(channel="ibm_quantum_platform", token=token)
         except Exception:
             return QiskitRuntimeService()
     return QiskitRuntimeService()
