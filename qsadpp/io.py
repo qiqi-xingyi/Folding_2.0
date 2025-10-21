@@ -128,7 +128,8 @@ def read_samples(paths: Sequence[Path | str]) -> pd.DataFrame:
 
     frames = []
     for f in files:
-        df = pd.read_csv(f)
+        # force bitstring to be read as string (preserve leading zeros)
+        df = pd.read_csv(f, dtype={"bitstring": "string"})
         df = _coerce_columns(df)
         frames.append(df)
     out = pd.concat(frames, ignore_index=True)
@@ -152,6 +153,26 @@ def aggregate_counts_to_prob(
     if they are constant within a group; otherwise the aggregated values will be NaN.
     """
     df = df.copy()
+
+    def _normalize_bits_group(g: pd.DataFrame) -> pd.DataFrame:
+        if "bitstring" not in g.columns:
+            return g
+        # ensure string and strip spaces (not zeros)
+        g["bitstring"] = g["bitstring"].astype("string").fillna("").str.strip()
+
+        # choose width: prefer n_qubits if present (max in group), else max current length
+        if "n_qubits" in g.columns and g["n_qubits"].notna().any():
+            # some rows might have NA; take the max numeric value in group
+            width = int(pd.to_numeric(g["n_qubits"], errors="coerce").max())
+            if not np.isfinite(width) or width <= 0:
+                width = int(g["bitstring"].str.len().max())
+        else:
+            width = int(g["bitstring"].str.len().max())
+
+        g["bitstring"] = g["bitstring"].astype(str).str.zfill(width)
+        return g
+
+    df = df.groupby(list(group_keys), dropna=False, group_keys=False).apply(_normalize_bits_group)
 
     # Sum counts per (group, bitstring)
     agg_cols = list(group_keys) + ["bitstring"]
