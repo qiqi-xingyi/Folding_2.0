@@ -56,32 +56,64 @@ RAW_COLUMNS: Tuple[str, ...] = (
 )
 
 
-def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce dtypes and ensure required columns exist.
+# def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
+#     """Coerce dtypes and ensure required columns exist.
+#
+#     - Missing optional "prob" will be filled later.
+#     - String columns are stripped of whitespace.
+#     """
+#     # Ensure required columns exist
+#     missing = set(RAW_COLUMNS) - set(df.columns)
+#     # "prob" can be missing; allow it
+#     missing.discard("prob")
+#     if missing:
+#         raise ValueError(f"Missing required columns: {sorted(missing)}")
+#
+#     # Basic dtype coercions
+#     str_cols = [
+#         "label",
+#         "backend",
+#         "ibm_backend",
+#         "circuit_hash",
+#         "protein",
+#         "sequence",
+#         "bitstring",
+#     ]
+#     for c in str_cols:
+#         if c in df.columns:
+#             df[c] = df[c].astype(str).str.strip()
+#
+#     int_cols = ["L", "n_qubits", "shots", "seed"]
+#     for c in int_cols:
+#         if c in df.columns:
+#             df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+#
+#     if "beta" in df.columns:
+#         df["beta"] = pd.to_numeric(df["beta"], errors="coerce")
+#
+#     if "count" in df.columns:
+#         df["count"] = pd.to_numeric(df["count"], errors="coerce").fillna(0).astype(int)
+#
+#     if "prob" in df.columns:
+#         df["prob"] = pd.to_numeric(df["prob"], errors="coerce")
+#
+#     return df
 
-    - Missing optional "prob" will be filled later.
-    - String columns are stripped of whitespace.
-    """
-    # Ensure required columns exist
+def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Coerce dtypes and ensure required columns exist."""
     missing = set(RAW_COLUMNS) - set(df.columns)
-    # "prob" can be missing; allow it
     missing.discard("prob")
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    # Basic dtype coercions
+    # keep real NA (pandas NA), do not coerce to "nan" string
     str_cols = [
-        "label",
-        "backend",
-        "ibm_backend",
-        "circuit_hash",
-        "protein",
-        "sequence",
-        "bitstring",
+        "label", "backend", "ibm_backend", "circuit_hash",
+        "protein", "sequence", "bitstring",
     ]
     for c in str_cols:
         if c in df.columns:
-            df[c] = df[c].astype(str).str.strip()
+            df[c] = df[c].astype("string").str.strip()
 
     int_cols = ["L", "n_qubits", "shots", "seed"]
     for c in int_cols:
@@ -98,6 +130,7 @@ def _coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["prob"] = pd.to_numeric(df["prob"], errors="coerce")
 
     return df
+
 
 
 def read_samples(paths: Sequence[Path | str]) -> pd.DataFrame:
