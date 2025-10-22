@@ -82,6 +82,7 @@ class SamplingRunner:
                     **self.meta,
                 )
 
+
                 rows.extend(counts_to_rows(counts, meta))
 
         df = write_csv(rows, self.cfg.out_csv, write_parquet=self.cfg.write_parquet)

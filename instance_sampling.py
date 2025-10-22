@@ -109,7 +109,6 @@ def per_example_sampling(protein_name: str, sequence: str) -> str:
                 "protein": protein_name,
                 "sequence": sequence,
                 "group_id": group_id,
-                "shots": SHOTS_PER_GROUP,
             },
         )
         runner = SamplingRunner(cfg, H)
