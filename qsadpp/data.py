@@ -56,33 +56,45 @@ W	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.
 Y	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
 """
 
+# data.py  —— replace _parse_mj_tsv with a more permissive parser
 def _parse_mj_tsv(text: str) -> Dict[str, Dict[str, float]]:
     """
     Parse a Miyazawa–Jernigan matrix from whitespace/TSV text.
 
-    Supported formats:
-      - Header: 20 one-letter amino acids in any order.
-      - Data: 20 rows, each with 20 numeric values.
-        This may represent a full matrix or an upper-triangular matrix
-        (with zeros in the lower triangle). The parser will symmetrize
-        by mirroring the upper triangle to the lower.
+    Accepted headers:
+      - "AA <20 AA letters>"
+      - "<20 AA letters>"
+    Accepted rows:
+      - "<rowAA> <20 numbers>"
+      - "<20 numbers>"  (row AA inferred from header order)
+    The parser symmetrizes the final table.
     """
     lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
     header = lines[0].split()
-    assert header[0] == "AA", "Header must start with 'AA'"
-    aa_cols = header[1:]
+    if header[0] == "AA":
+        aa_cols = header[1:]
+    else:
+        aa_cols = header
     assert len(aa_cols) == 20, "Header must contain 20 amino acids"
 
-    table: Dict[str, Dict[str, float]] = {aa: {} for aa in aa_cols}
-    assert len(lines[1:]) == 20, "Expected 20 data rows"
+    rows = lines[1:]
+    assert len(rows) == 20, "Expected 20 data rows"
 
-    for row in lines[1:]:
+    table: Dict[str, Dict[str, float]] = {aa: {} for aa in aa_cols}
+    for i, row in enumerate(rows):
         parts = row.split()
-        aa = parts[0]
-        vals = [float(x) for x in parts[1:]]
-        assert len(vals) == 20, "Each row must have 20 numeric entries"
+        if len(parts) == 21:
+            aa = parts[0]
+            vals = parts[1:]
+        elif len(parts) == 20:
+            aa = aa_cols[i]
+            vals = parts
+        else:
+            raise ValueError("Each row must have either 20 numbers or a label plus 20 numbers.")
+        vals_f = [float(x) for x in vals]
+        assert len(vals_f) == 20
         for j, aa2 in enumerate(aa_cols):
-            table[aa].setdefault(aa2, vals[j])
+            table[aa].setdefault(aa2, vals_f[j])
 
     # Symmetrize
     for a in aa_cols:
@@ -90,6 +102,7 @@ def _parse_mj_tsv(text: str) -> Dict[str, Dict[str, float]]:
             v = 0.5 * (table[a].get(b, 0.0) + table[b].get(a, 0.0))
             table[a][b] = table[b][a] = v
     return table
+
 
 
 _MJ_CACHE: Optional[Dict[str, Dict[str, float]]] = None
