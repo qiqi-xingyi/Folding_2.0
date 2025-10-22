@@ -176,7 +176,7 @@ def cluster_group(
 
 def select_topK_per_group(
     df: pd.DataFrame,
-    labels: pd.Series,
+    labels: Optional[pd.Series] = None,
     per_cluster_max: int = 2,
     beta_logq: float = 0.2,
 ) -> pd.DataFrame:
@@ -186,7 +186,11 @@ def select_topK_per_group(
     Lower score is better.
     """
     work = df.copy()
-    work["cluster"] = labels.values
+    if labels is not None:
+        work["cluster"] = labels.values
+    elif "cluster" not in work.columns:
+        raise ValueError("Cluster labels are required: pass `labels` or provide a 'cluster' column in df.")
+
 
     q = pd.to_numeric(work.get("q_prob", 1.0), errors="coerce").fillna(1.0)
     q = q.clip(lower=1e-300)
