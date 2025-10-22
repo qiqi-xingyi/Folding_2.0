@@ -169,7 +169,7 @@ class IBMSamplerBackend(SamplerBackend):
     def run_counts(self, circuit: QuantumCircuit) -> Dict[str, int]:
         # Expand library gates and then transpile to the target backend's native gate set and coupling map
         lowered = expand_high_level(circuit)
-        tcirc = transpile(lowered, backend=self._backend, optimization_level=1)
+        tcirc = transpile(lowered, backend=self._backend, optimization_level=3)
 
         job = self._sampler.run([tcirc], shots=self.shots)
         result = job.result()

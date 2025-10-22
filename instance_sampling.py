@@ -134,6 +134,7 @@ def per_example_sampling(protein_name: str, sequence: str) -> str:
     return ""
 
 if __name__ == "__main__":
+
     service = init_ibm_service()
 
     all_combined = []
