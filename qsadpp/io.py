@@ -311,8 +311,6 @@ def aggregate_counts_to_prob(
 
     return gb
 
-
-
 def iter_groups(
     df: pd.DataFrame,
     group_keys: Sequence[str] = GROUP_KEYS,
