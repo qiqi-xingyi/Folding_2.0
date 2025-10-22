@@ -1,4 +1,4 @@
-# --*-- conding:utf-8 --*--
+# --*-- coding:utf-8 --*--
 # @time:10/21/25 14:11
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
@@ -24,13 +24,13 @@ from .io import (
 from .data import get_mj_table
 from .features import compute_tierA_features, TierAWeights
 from .cluster import ClusterConfig, cluster_group, select_topK_per_group
-from .utils import write_xyz
+from .utils import write_xyz_ca
 
 # Optional imports for visuals; wrapped in try/except below
 try:
     from .visuals import (
-        plot_energy_histogram,
-        plot_energy_vs_logq,
+        plot_energy_hist,
+        plot_S_vs_logq,
         plot_energy_box_by_cluster,
     )
     _HAS_VISUALS = True
@@ -44,128 +44,95 @@ class PipelinePaths:
     reports_dir: Path
     reps_root: Path
 
+    @staticmethod
+    def make(root: str | Path) -> "PipelinePaths":
+        rootp = Path(root)
+        analysis = rootp / "analysis"
+        reports = analysis / "reports"
+        reps = rootp / "rep_structures"
+        analysis.mkdir(parents=True, exist_ok=True)
+        reports.mkdir(parents=True, exist_ok=True)
+        reps.mkdir(parents=True, exist_ok=True)
+        return PipelinePaths(analysis, reports, reps)
 
-def _ensure_dirs(out_dir: Path) -> PipelinePaths:
-    analysis = out_dir / "analysis"
-    reports = analysis / "reports"
-    reps = out_dir / "rep_structures"
-    analysis.mkdir(parents=True, exist_ok=True)
-    reports.mkdir(parents=True, exist_ok=True)
-    reps.mkdir(parents=True, exist_ok=True)
-    return PipelinePaths(analysis, reports, reps)
 
-
-def _decode_one_coords(
-    problem_builder: Callable[[Mapping[str, object]], object],
-    meta: Mapping[str, object],
-    bitstring: str,
-) -> np.ndarray:
+def _decode_one_coords(problem_obj, bitstring: str) -> np.ndarray:
     """
-    Minimal and robust decoding:
-    - Build a problem object for the meta.
-    - Call interpret with a distribution that concentrates on this bitstring.
-    - Expect the returned object to provide get_calpha_coords().
+    Decode one bitstring to Cα coordinates using the provided problem object.
+
+    The problem object must provide a method:
+        interpret({"bitstring": ..., "prob": ...}) -> {"coords": np.ndarray(L,3), ...}
     """
-    problem = problem_builder(meta)
-    binary_probs = {bitstring: 1.0}
-    result = problem.interpret(binary_probs)
-    coords = np.asarray(result.get_calpha_coords(), dtype=float)
-    if coords.ndim != 2 or coords.shape[1] != 3:
-        raise ValueError("Decoded coordinates must be (L, 3).")
+    res = problem_obj.interpret({"bitstring": bitstring, "prob": 1.0})
+    coords = np.asarray(res["coords"], dtype=float)
+    assert coords.ndim == 2 and coords.shape[1] == 3, "coords must be (L,3)"
     return coords
 
 
 def _features_for_group(
+    df_group: pd.DataFrame,
     meta: Mapping[str, object],
-    group_df: pd.DataFrame,
-    build_problem: Callable[[Mapping[str, object]], object],
-    mj_table: Mapping[str, Mapping[str, float]],
+    mj_table: Dict[str, Dict[str, float]],
     weights: TierAWeights,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
     """
-    Compute per-bitstring features for a single group.
+    Compute features for all bitstrings within one metadata group.
+    Returns a (features_df, extra_info) tuple.
     """
-    rows: List[Dict[str, object]] = []
-    sequence = str(meta.get("sequence", ""))
-    protein = str(meta.get("protein", ""))
-    label = meta.get("label")
-    backend = meta.get("backend")
-    ibm_backend = meta.get("ibm_backend")
-    beta = meta.get("beta")
-    seed = meta.get("seed")
-    circuit_hash = meta.get("circuit_hash")
+    bitstrings = df_group["bitstring"].astype(str).tolist()
+    probs = pd.to_numeric(df_group["prob"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
 
-    for _, r in group_df.iterrows():
-        bitstring = str(r["bitstring"])
-        q_prob = float(r["prob"])
+    # -- Decode all to coords (Cα only) --
+    problem = meta["__problem__"]
+    coords_list: List[np.ndarray] = []
+    for b in bitstrings:
         try:
-            ca = _decode_one_coords(build_problem, meta, bitstring)
+            coords = _decode_one_coords(problem, b)
         except Exception:
-            # Fail-safe: skip this item if decoding fails
-            continue
+            # fall back to NaN entry if decoding fails; will be dropped later
+            coords = np.full((int(meta["L"]), 3), np.nan, dtype=float)
+        coords_list.append(coords)
 
-        feats = compute_tierA_features(sequence, ca, mj_table, weights=weights)
-        feats.update(
-            dict(
-                bitstring=bitstring,
-                q_prob=q_prob,
-                protein=protein,
-                sequence=sequence,
-                label=label,
-                backend=backend,
-                ibm_backend=ibm_backend,
-                beta=beta,
-                seed=seed,
-                circuit_hash=circuit_hash,
-            )
-        )
-        rows.append(feats)
-
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "E_A",
-                "E_clash",
-                "E_mj",
-                "R_g",
-                "clash_cnt",
-                "contact_cnt",
-                "bitstring",
-                "q_prob",
-                "protein",
-                "sequence",
-                "label",
-                "backend",
-                "ibm_backend",
-                "beta",
-                "seed",
-                "circuit_hash",
-            ]
-        )
-
-    return pd.DataFrame(rows)
+    # -- Compute Tier-A features --
+    features = compute_tierA_features(
+        coords_list=coords_list,
+        sequence=str(meta["sequence"]),
+        probs=probs,
+        mj_table=mj_table,
+        weights=weights,
+    )
+    # attach metadata columns
+    for k in ["protein", "sequence", "label", "backend", "ibm_backend", "beta", "seed", "circuit_hash", "L"]:
+        features[k] = meta.get(k, None)
+    return features, {"decoded_ok": True}
 
 
 def _save_topK_xyz(
     reps_df: pd.DataFrame,
-    reps_root: Path,
     group_meta: Mapping[str, object],
-    build_problem: Callable[[Mapping[str, object]], object],
+    out_root: Path,
 ) -> None:
     """
-    Export XYZ for representative rows by re-decoding each bitstring.
+    Save Top-K representative Cα-only XYZ files for quick visualization/docking.
     """
     protein = str(group_meta.get("protein", "unknown"))
     sequence = str(group_meta.get("sequence", ""))
-    subdir_name = f"{protein}_{sequence}"
-    out_dir = reps_root / subdir_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    L = int(group_meta.get("L", len(sequence)))
+    group_dir = out_root / protein
+    group_dir.mkdir(parents=True, exist_ok=True)
 
-    for rank, (_, row) in enumerate(reps_df.iterrows(), start=1):
+    for _, row in reps_df.iterrows():
         bitstring = str(row["bitstring"])
-        coords = _decode_one_coords(build_problem, group_meta, bitstring)
-        xyz_path = out_dir / f"top5_{rank}_{bitstring}.xyz"
-        write_xyz(xyz_path, coords, title=f"{protein} {sequence} {bitstring}")
+        try:
+            coords = np.asarray(row["coords"], dtype=float)
+            if coords.shape != (L, 3):
+                continue
+            xyz_path = group_dir / f"{protein}_{bitstring[:16]}_L{L}.xyz"
+            # Use the sequence as the element labels
+            write_xyz_ca(xyz_path, coords, sequence)
+        except Exception:
+            # skip any malformed row
+            pass
 
 
 def run_full_pipeline(
@@ -183,16 +150,20 @@ def run_full_pipeline(
     """
     End-to-end post-processing:
       1) Read raw CSVs and normalize.
-      2) Aggregate counts to probabilities per group.
-      3) Reverse decode each bitstring to coordinates and compute features.
-      4) Cluster per group and pick representatives.
-      5) Save analysis tables, reports, and Top-K XYZ files.
+      2) Aggregate counts -> probabilities per experiment group.
+      3) Load MJ table.
+      4) For each group:
+         a) decode all bitstrings -> coords
+         b) compute Tier-A features (E_clash, E_mj, R_g, E_A)
+         c) cluster + select representatives
+         d) save analysis tables and representative XYZs
+      5) Generate report plots (if matplotlib available).
     """
-    out_dir = Path(output_dir)
-    paths = _ensure_dirs(out_dir)
+    paths = PipelinePaths.make(output_dir)
 
     # 1) Read
     raw = read_samples(csv_paths)
+    save_parquet(raw, paths.analysis_dir / "raw.parquet")
 
     # 2) Aggregate
     clean = aggregate_counts_to_prob(raw, group_keys=GROUP_KEYS, validate_shots=False)
@@ -208,91 +179,88 @@ def run_full_pipeline(
     all_assignments_rows: List[pd.DataFrame] = []
     all_reps_rows: List[pd.DataFrame] = []
 
-    # Iterate groups
-    for gid, (meta, gdf) in enumerate(iter_groups(clean, group_keys=GROUP_KEYS), start=1):
-        # Compute features for this group
-        feat_df = _features_for_group(
-            meta=meta,
-            group_df=gdf,
-            build_problem=build_problem,
-            mj_table=mj_table,
-            weights=weights,
-        )
+    # 4) Iterate over groups
+    for gid, (meta, df_group) in enumerate(iter_groups(clean)):
+        meta = dict(meta)
+        meta["__problem__"] = build_problem(meta)
+        meta["group_id"] = gid
 
-        if feat_df.empty:
+        try:
+            feat_df, _ = _features_for_group(df_group, meta, mj_table, weights)
+        except Exception:
+            # skip group on fatal errors
             continue
 
-        # Save per-group features intermediate if desired (optional)
-        all_features_rows.append(feat_df.assign(group_id=gid))
+        # store group id
+        feat_df["group_id"] = gid
+        all_features_rows.append(feat_df)
+        save_parquet(feat_df, paths.analysis_dir / f"group_{gid:04d}_features.parquet")
 
-        # Cluster
-        labels, centers, used = cluster_group(feat_df, cluster_cfg)
-
-        # Assignments dataframe
-        assignments_df = feat_df.copy()
-        assignments_df["cluster"] = labels.values
-        all_assignments_rows.append(assignments_df.assign(group_id=gid))
-
-        # Representatives
-        reps_df = select_topK_per_group(
-            feat_df,
-            labels,
-            per_cluster_max=per_cluster_max,
-            beta_logq=cluster_cfg.beta_logq,
-        )
-        # Limit to topK_per_group globally per group
-        if len(reps_df) > topK_per_group:
-            reps_df = reps_df.sort_values("E_A").head(topK_per_group)
-        all_reps_rows.append(reps_df.assign(group_id=gid))
-
-        # Save XYZ for representatives of this group
+        # clustering per group
         try:
-            _save_topK_xyz(reps_df, paths.reps_root, meta, build_problem)
+            labels, centers, used = cluster_group(feat_df, cluster_cfg)
+            assign = feat_df.loc[used, ["bitstring", "E_A", "q_prob", "protein", "sequence"]].copy()
+            assign["group_id"] = gid
+            assign["cluster"] = labels
+            all_assignments_rows.append(assign)
+            save_parquet(assign, paths.analysis_dir / f"group_{gid:04d}_clusters.parquet")
+
+            reps = select_topK_per_group(
+                assign.merge(feat_df[["bitstring", "coords"]], on="bitstring", how="left"),
+                topK=topK_per_group,
+                per_cluster_max=per_cluster_max,
+                beta_logq=cluster_cfg.beta_logq,
+            )
+            reps["group_id"] = gid
+            all_reps_rows.append(reps)
+            save_csv(reps, paths.analysis_dir / f"group_{gid:04d}_representatives.csv")
+
+            # export XYZ
+            _save_topK_xyz(reps, meta, paths.reps_root)
+
         except Exception:
-            # Continue even if XYZ export fails for some representatives
+            # clustering is optional; continue pipeline even if it fails
             pass
 
-    # Concatenate across groups
+    # Roll-up tables
     if all_features_rows:
-        features = pd.concat(all_features_rows, ignore_index=True)
-        save_parquet(features, paths.analysis_dir / "features.parquet")
-        # Also write CSV for human inspection
-        save_csv(features, paths.analysis_dir / "features.csv")
-
+        features_all = pd.concat(all_features_rows, ignore_index=True)
+        save_parquet(features_all, paths.analysis_dir / "features.parquet")
+        save_csv(features_all, paths.analysis_dir / "features.csv")
     if all_assignments_rows:
-        clusters = pd.concat(all_assignments_rows, ignore_index=True)
-        save_parquet(clusters, paths.analysis_dir / "clusters.parquet")
-
-    if all_reps_rows:
-        reps_all = pd.concat(all_reps_rows, ignore_index=True)
-        # Save representatives and a ranking view
-        reps_all = reps_all.copy()
-        # A simple ranking by E_A then -q_prob
-        ranking = reps_all.sort_values(["E_A", "q_prob"], ascending=[True, False])
-        save_csv(reps_all, paths.analysis_dir / "representatives.csv")
-        save_csv(ranking, paths.analysis_dir / "ranking.csv")
-
-        # Per-cluster stats (optional)
-        if all_assignments_rows:
-            try:
-                stats = (
-                    clusters.groupby(["group_id", "cluster"])["E_A"]
-                    .agg(["count", "mean", "min", "max"])
-                    .reset_index()
-                )
-                save_csv(stats, paths.analysis_dir / "cluster_stats.csv")
-            except Exception:
-                pass
+        clusters_all = pd.concat(all_assignments_rows, ignore_index=True)
+        save_parquet(clusters_all, paths.analysis_dir / "clusters.parquet")
+        save_csv(clusters_all, paths.analysis_dir / "clusters.csv")
+        # basic stats
+        try:
+            stats = (
+                clusters_all.groupby(["group_id", "cluster"])["E_A"]
+                .agg(["count", "mean", "min", "max"])
+                .reset_index()
+            )
+            save_csv(stats, paths.analysis_dir / "cluster_stats.csv")
+        except Exception:
+            pass
 
     # Reports
     if _HAS_VISUALS and all_features_rows:
         try:
             features = pd.concat(all_features_rows, ignore_index=True)
-            plot_energy_histogram(features, paths.reports_dir / "energy_hist.pdf")
-            plot_energy_vs_logq(features, paths.reports_dir / "S_vs_logq.pdf")
+            # Add S = E_A - beta_logq * log(q_prob) for plotting
+            _q = np.clip(
+                pd.to_numeric(features["q_prob"], errors="coerce")
+                .fillna(1e-300)
+                .to_numpy(dtype=float),
+                1e-300,
+                None,
+            )
+            _EA = pd.to_numeric(features["E_A"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+            features["S"] = (_EA - cluster_cfg.beta_logq * np.log(_q)).astype(float)
+
+            plot_energy_hist(features, paths.reports_dir / "energy_hist.pdf")
+            plot_S_vs_logq(features, paths.reports_dir / "S_vs_logq.pdf")
             if all_assignments_rows:
                 clusters = pd.concat(all_assignments_rows, ignore_index=True)
                 plot_energy_box_by_cluster(clusters, paths.reports_dir / "energy_box_by_cluster.pdf")
         except Exception:
             pass
-

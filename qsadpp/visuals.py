@@ -1,4 +1,4 @@
-# --*-- conding:utf-8 --*--
+# --*-- coding:utf-8 --*--
 # @time:10/21/25 14:11
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
@@ -18,19 +18,22 @@ Each plot saver returns the output path for convenience.
 
 from __future__ import annotations
 from pathlib import Path
+from typing import Union
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def plot_energy_hist(df: pd.DataFrame, out_path: str | Path, title: str = "Energy (E_A) Distribution") -> str:
+def plot_energy_hist(df: pd.DataFrame, out_path: Union[str, Path], title: str = "E_A histogram") -> str:
     p = Path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    EA = df["E_A"].to_numpy(dtype=float)
     plt.figure()
-    plt.hist(df["E_A"].to_numpy(dtype=float), bins=50)
-    plt.title(title)
+    plt.hist(EA, bins=50)
     plt.xlabel("E_A")
     plt.ylabel("Count")
+    plt.title(title)
     plt.tight_layout()
     plt.savefig(p)
     plt.close()

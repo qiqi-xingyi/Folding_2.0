@@ -1,4 +1,4 @@
-# --*-- conding:utf-8 --*--
+# --*-- coding:utf-8 --*--
 # @time:10/21/25 14:03
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
@@ -14,33 +14,47 @@ an environment variable `QSADPP_MJ_PATH`.
 
 API
 ---
-- `get_mj_table(path: str | Path | None = None) -> dict`
-  Return the nested-dict MJ table using the canonical 20-AA order.
+- load_mj_table_file(path) -> dict[aa1][aa2] = float
+- get_mj_table(path: Optional[str]) -> cached table (env var QSADPP_MJ_PATH honored)
 
-Implementation notes
---------------------
-- Parsing is dependency-light (no pandas required).
-- The embedded matrix below is a **placeholder** (zeros). Replace it with your
-  true MJ matrix by editing `MJ_DEFAULT_TSV` or by providing a file path/env var.
+Notes
+-----
+If you need a different default, you can plug in your lab's
+true MJ matrix by editing `MJ_DEFAULT_TSV` or by providing a file path/env var.
 """
+
 from __future__ import annotations
+from typing import Dict, List, Optional
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import os
 
-# Canonical 20-AA order. **Must** match the matrix header/order below and anywhere else.
 AA20: List[str] = list("ACDEFGHIKLMNPQRSTVWY")
 
-# -----------------------------------------------------------------------------
-# Embedded default MJ matrix (TSV-like). Header row + 20 rows. Placeholder zeros.
-# Replace with your lab's matrix for real experiments.
-# -----------------------------------------------------------------------------
-MJ_DEFAULT_TSV: str = (
-    "	".join(["AA"] + AA20) + " "+ " ".join(
-        ["	".join([aa] + ["0.0"] * 20) for aa in AA20]
-    )
-)
-
+# A minimal **symmetric zero** MJ matrix placeholder (21 lines: header + 20 AA lines),
+# formatted as a proper TSV so the parser can always read it.
+MJ_DEFAULT_TSV: str = """
+AA	A	C	D	E	F	G	H	I	K	L	M	N	P	Q	R	S	T	V	W	Y
+A	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+C	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+D	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+E	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+F	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+G	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+H	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+I	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+K	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+L	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+M	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+N	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+P	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+Q	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+R	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+S	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+T	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+V	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+W	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+Y	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0	0.0
+"""
 
 def _parse_mj_tsv(text: str) -> Dict[str, Dict[str, float]]:
     """
@@ -51,82 +65,46 @@ def _parse_mj_tsv(text: str) -> Dict[str, Dict[str, float]]:
       - Data: 20 rows, each with 20 numeric values.
         This may represent a full matrix or an upper-triangular matrix
         (with zeros in the lower triangle). The parser will symmetrize
-        by mirroring the upper triangle to the lower triangle.
-
-    Returns a nested dict: table[row_aa][col_aa] = float
+        by mirroring the upper triangle to the lower.
     """
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    if not lines:
-        raise ValueError("Empty MJ TSV content")
-
-    # Header
+    lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
     header = lines[0].split()
-    if header[0].upper() in {"AA", "RES", "IDX"}:
-        header = header[1:]
-    cols = [h.strip().upper() for h in header]
-    if len(cols) != 20:
-        raise ValueError(f"Expected 20 AA columns, got {len(cols)}: {cols}")
-    if any(len(c) != 1 for c in cols):
-        raise ValueError(f"Column labels must be one-letter amino acid codes, got: {cols}")
+    assert header[0] == "AA", "Header must start with 'AA'"
+    aa_cols = header[1:]
+    assert len(aa_cols) == 20, "Header must contain 20 amino acids"
 
-    # Must have 20 data rows
-    if len(lines) - 1 != 20:
-        raise ValueError(f"Expected 20 data rows after the header, got {len(lines) - 1}")
+    table: Dict[str, Dict[str, float]] = {aa: {} for aa in aa_cols}
+    assert len(lines[1:]) == 20, "Expected 20 data rows"
 
-    # Parse numeric 20x20 matrix (unlabeled rows)
-    M = []
-    for ln in lines[1:]:
-        parts = ln.split()
-        if len(parts) != 20:
-            raise ValueError(f"Row must have 20 numeric values, got: {ln}")
-        M.append([float(x) for x in parts])
-    import numpy as np  # local import to avoid hard dependency at module import
-    M = np.asarray(M, dtype=float)
-    if M.shape != (20, 20):
-        raise ValueError(f"Parsed matrix has wrong shape: {M.shape}")
+    for row in lines[1:]:
+        parts = row.split()
+        aa = parts[0]
+        vals = [float(x) for x in parts[1:]]
+        assert len(vals) == 20, "Each row must have 20 numeric entries"
+        for j, aa2 in enumerate(aa_cols):
+            table[aa].setdefault(aa2, vals[j])
 
-    # Symmetrize: assume values on/above diagonal are authoritative.
-    # Mirror M[i,j] to M[j,i] for i <= j. If lower triangle has non-zero conflicting
-    # entries, the upper-triangle value takes precedence.
-    for i in range(20):
-        for j in range(i, 20):
-            val = M[i, j]
-            M[j, i] = val
-
-    # Build nested dict table[row_aa][col_aa]
-    table: Dict[str, Dict[str, float]] = {aa: {} for aa in cols}
-    for i, ri in enumerate(cols):
-        for j, cj in enumerate(cols):
-            table[ri][cj] = float(M[i, j])
-
-    # Sanity check
-    if len(table) != 20 or any(len(row) != 20 for row in table.values()):
-        raise ValueError("MJ table is incomplete after parsing.")
-
+    # Symmetrize
+    for a in aa_cols:
+        for b in aa_cols:
+            v = 0.5 * (table[a].get(b, 0.0) + table[b].get(a, 0.0))
+            table[a][b] = table[b][a] = v
     return table
 
 
-
-
-def load_mj_table_file(path: str | Path) -> Dict[str, Dict[str, float]]:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(p)
-    text = p.read_text(encoding="utf-8")
-    return _parse_mj_tsv(text)
-
-
-# simple module-level cache
 _MJ_CACHE: Optional[Dict[str, Dict[str, float]]] = None
 
 
-def get_mj_table(path: str | Path | None = None) -> Dict[str, Dict[str, float]]:
-    """Return the MJ table as a nested dict.
+def load_mj_table_file(path: str | Path) -> Dict[str, Dict[str, float]]:
+    txt = Path(path).read_text(encoding="utf-8")
+    return _parse_mj_tsv(txt)
 
-    Resolution order:
-    1) explicit `path` argument
-    2) env var `QSADPP_MJ_PATH`
-    3) built-in `MJ_DEFAULT_TSV`
+
+def get_mj_table(path: Optional[str | Path] = None) -> Dict[str, Dict[str, float]]:
+    """
+    1) If `path` provided, load that file.
+    2) Else if environment variable `QSADPP_MJ_PATH` is set, load it.
+    3) Else use built-in `MJ_DEFAULT_TSV`
     """
     global _MJ_CACHE
     if _MJ_CACHE is not None and path is None and os.getenv("QSADPP_MJ_PATH") is None:
