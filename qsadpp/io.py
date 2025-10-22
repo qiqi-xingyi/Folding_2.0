@@ -169,57 +169,125 @@ def read_samples(paths: Sequence[Path | str]) -> pd.DataFrame:
     return out
 
 
+# def aggregate_counts_to_prob(
+#     df: pd.DataFrame,
+#     group_keys: Sequence[str] = GROUP_KEYS,
+#     validate_shots: bool = True,
+# ) -> pd.DataFrame:
+#     """Aggregate duplicate (group, bitstring) rows and compute probabilities.
+#
+#     - For each group (by group_keys), sum counts per bitstring.
+#     - If a "prob" column exists, it is ignored and recomputed from counts.
+#     - Optionally validate that sum(count) ≈ shots per group (if shots present).
+#
+#     Returns a tidy frame with columns:
+#       group_keys + ["bitstring", "count", "prob"] + ("shots" if present and unique per group)
+#     Other metadata columns like L, n_qubits are carried via groupby aggregation
+#     if they are constant within a group; otherwise the aggregated values will be NaN.
+#     """
+#     df = df.copy()
+#
+#     def _normalize_bits_group(g: pd.DataFrame) -> pd.DataFrame:
+#         if "bitstring" not in g.columns:
+#             return g
+#         # ensure string and strip spaces (not zeros)
+#         g["bitstring"] = g["bitstring"].astype("string").fillna("").str.strip()
+#
+#         # choose width: prefer n_qubits if present (max in group), else max current length
+#         if "n_qubits" in g.columns and g["n_qubits"].notna().any():
+#             # some rows might have NA; take the max numeric value in group
+#             width = int(pd.to_numeric(g["n_qubits"], errors="coerce").max())
+#             if not np.isfinite(width) or width <= 0:
+#                 width = int(g["bitstring"].str.len().max())
+#         else:
+#             width = int(g["bitstring"].str.len().max())
+#
+#         g["bitstring"] = g["bitstring"].astype(str).str.zfill(width)
+#         return g
+#
+#     df = df.groupby(list(group_keys), dropna=False, group_keys=False).apply(_normalize_bits_group)
+#
+#     # Sum counts per (group, bitstring)
+#     agg_cols = list(group_keys) + ["bitstring"]
+#     gb = df.groupby(agg_cols, dropna=False, as_index=False)["count"].sum()
+#
+#     # Attach shots if available: if multiple shots per group, keep NaN
+#     if "shots" in df.columns:
+#         shots_df = (
+#             df.groupby(list(group_keys), dropna=False)["shots"].nunique().reset_index(name="_nshots")
+#         )
+#         # if exactly one unique shots per group, take it; else NaN
+#         shots_val = (
+#             df.groupby(list(group_keys), dropna=False)["shots"].max().reset_index(name="shots")
+#         )
+#         gb = gb.merge(shots_df, on=list(group_keys), how="left").merge(shots_val, on=list(group_keys), how="left")
+#         gb.loc[gb["_nshots"] != 1, "shots"] = np.nan
+#         gb = gb.drop(columns=["_nshots"])
+#
+#     # Compute prob by normalizing counts within each group
+#     gb["prob"] = gb["count"] / gb.groupby(list(group_keys))["count"].transform("sum")
+#
+#     # Optional validation: sum(count) close to shots
+#     if validate_shots and "shots" in gb.columns:
+#         check = gb.groupby(list(group_keys), dropna=False).agg(
+#             shots=("shots", "first"),
+#             sum_count=("count", "sum"),
+#         ).reset_index()
+#         # allow small deviation (e.g., dropped reads); flag when >5%
+#         check["rel_err"] = np.where(
+#             check["shots"].notna(),
+#             np.abs(check["sum_count"] - check["shots"]) / check["shots"].replace(0, np.nan),
+#             np.nan,
+#         )
+#         bad = check[check["rel_err"] > 0.05]
+#         if not bad.empty:
+#             # Raise a warning-like exception so caller can decide to proceed or not
+#             raise RuntimeError(
+#                 "Sum(count) deviates from shots by >5% for some groups. Inspect 'bad_groups' attribute."
+#             )
+#
+#     return gb
+
 def aggregate_counts_to_prob(
     df: pd.DataFrame,
     group_keys: Sequence[str] = GROUP_KEYS,
     validate_shots: bool = True,
 ) -> pd.DataFrame:
-    """Aggregate duplicate (group, bitstring) rows and compute probabilities.
-
-    - For each group (by group_keys), sum counts per bitstring.
-    - If a "prob" column exists, it is ignored and recomputed from counts.
-    - Optionally validate that sum(count) ≈ shots per group (if shots present).
-
-    Returns a tidy frame with columns:
-      group_keys + ["bitstring", "count", "prob"] + ("shots" if present and unique per group)
-    Other metadata columns like L, n_qubits are carried via groupby aggregation
-    if they are constant within a group; otherwise the aggregated values will be NaN.
-    """
     df = df.copy()
 
     def _normalize_bits_group(g: pd.DataFrame) -> pd.DataFrame:
         if "bitstring" not in g.columns:
             return g
-        # ensure string and strip spaces (not zeros)
-        g["bitstring"] = g["bitstring"].astype("string").fillna("").str.strip()
 
-        # choose width: prefer n_qubits if present (max in group), else max current length
+        # keep only valid binary strings; drop NA and invalid rows
+        bs = g["bitstring"]
+        mask = bs.notna() & bs.str.fullmatch(r"[01]+")
+        g = g.loc[mask].copy()
+
+        if g.empty:
+            return g  # nothing to do in this group
+
+        # width: prefer n_qubits (max per group); fallback to current max bitstring length
         if "n_qubits" in g.columns and g["n_qubits"].notna().any():
-            # some rows might have NA; take the max numeric value in group
-            width = int(pd.to_numeric(g["n_qubits"], errors="coerce").max())
-            if not np.isfinite(width) or width <= 0:
-                width = int(g["bitstring"].str.len().max())
+            width_val = pd.to_numeric(g["n_qubits"], errors="coerce").max()
+            width = int(width_val) if np.isfinite(width_val) and width_val > 0 else int(g["bitstring"].str.len().max())
         else:
             width = int(g["bitstring"].str.len().max())
 
-        g["bitstring"] = g["bitstring"].astype(str).str.zfill(width)
+        g["bitstring"] = g["bitstring"].astype("string").str.zfill(width)
         return g
 
-    df = df.groupby(list(group_keys), dropna=False, group_keys=False).apply(_normalize_bits_group)
+    # include_groups=True silences the FutureWarning on newer pandas
+    df = df.groupby(list(group_keys), dropna=False, group_keys=False, include_groups=True).apply(_normalize_bits_group)
 
     # Sum counts per (group, bitstring)
     agg_cols = list(group_keys) + ["bitstring"]
     gb = df.groupby(agg_cols, dropna=False, as_index=False)["count"].sum()
 
-    # Attach shots if available: if multiple shots per group, keep NaN
+    # Attach shots if available
     if "shots" in df.columns:
-        shots_df = (
-            df.groupby(list(group_keys), dropna=False)["shots"].nunique().reset_index(name="_nshots")
-        )
-        # if exactly one unique shots per group, take it; else NaN
-        shots_val = (
-            df.groupby(list(group_keys), dropna=False)["shots"].max().reset_index(name="shots")
-        )
+        shots_df = df.groupby(list(group_keys), dropna=False)["shots"].nunique().reset_index(name="_nshots")
+        shots_val = df.groupby(list(group_keys), dropna=False)["shots"].max().reset_index(name="shots")
         gb = gb.merge(shots_df, on=list(group_keys), how="left").merge(shots_val, on=list(group_keys), how="left")
         gb.loc[gb["_nshots"] != 1, "shots"] = np.nan
         gb = gb.drop(columns=["_nshots"])
@@ -227,13 +295,11 @@ def aggregate_counts_to_prob(
     # Compute prob by normalizing counts within each group
     gb["prob"] = gb["count"] / gb.groupby(list(group_keys))["count"].transform("sum")
 
-    # Optional validation: sum(count) close to shots
     if validate_shots and "shots" in gb.columns:
         check = gb.groupby(list(group_keys), dropna=False).agg(
             shots=("shots", "first"),
             sum_count=("count", "sum"),
         ).reset_index()
-        # allow small deviation (e.g., dropped reads); flag when >5%
         check["rel_err"] = np.where(
             check["shots"].notna(),
             np.abs(check["sum_count"] - check["shots"]) / check["shots"].replace(0, np.nan),
@@ -241,12 +307,10 @@ def aggregate_counts_to_prob(
         )
         bad = check[check["rel_err"] > 0.05]
         if not bad.empty:
-            # Raise a warning-like exception so caller can decide to proceed or not
-            raise RuntimeError(
-                "Sum(count) deviates from shots by >5% for some groups. Inspect 'bad_groups' attribute."
-            )
+            raise RuntimeError("Sum(count) deviates from shots by >5% for some groups.")
 
     return gb
+
 
 
 def iter_groups(
