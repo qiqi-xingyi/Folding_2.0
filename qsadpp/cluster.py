@@ -22,6 +22,10 @@ class ClusterConfig:
     beta_logq: float = 0.2
     temperature: float = 1.0
 
+    def __post_init__(self):
+        if self.n_clusters is not None and self.k == ClusterConfig.__dataclass_fields__["k"].default:
+            self.k = int(self.n_clusters)
+
 
 _NUM_CLIP = 1e6  # clip to avoid overflow in dot products
 
