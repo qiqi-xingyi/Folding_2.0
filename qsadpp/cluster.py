@@ -4,226 +4,264 @@
 # @Email : yzhan135@kent.edu
 # @File:cluster.py
 
-# qsadpp/cluster.py
-"""
-Clustering, representative selection, and ranking.
-
-We cluster *per group* using feature space (energy + geometry stats),
-with an optional sample weight (e.g., quantum probability reweighted
-by Boltzmann). We provide:
-
-- k-medoids implementation (pure NumPy; no external deps)
-- fallback KMeans (if scikit-learn is available) for speed (optional)
-- representative selection: per-cluster min-E and medoid
-- ranking score: S = E_A - beta * log(q_prob + eps)
-
-Inputs are pandas DataFrames produced by the pipeline (one row per bitstring).
-"""
-
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 
 
+@dataclass
+class ClusterConfig:
+    method: str = "kmedoids"  # or "kmeans"
+    k: int = 8
+    seed: int = 0
+    beta_logq: float = 0.2     # used later for scoring S = E_A - beta*log(q)
+    temperature: float = 1.0   # not used here directly
+
+
 # -------------------------------
-# Distance and k-medoids (NumPy)
+# Numeric matrix preparation
 # -------------------------------
 
-def _euclidean_cdist(X: np.ndarray, Y: Optional[np.ndarray] = None) -> np.ndarray:
+_NUM_CLIP = 1e6  # hard clip to avoid overflow in dot products
+
+
+def _select_numeric_columns(df: pd.DataFrame, candidate_cols: Optional[Sequence[str]] = None) -> List[str]:
+    if candidate_cols is None:
+        # default features if caller did not specify
+        candidate_cols = ["E_A", "E_clash", "E_mj", "R_g"]
+    cols = []
+    for c in candidate_cols:
+        if c in df.columns:
+            cols.append(c)
+    # keep only numeric
+    num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
+    return num_cols
+
+
+def _prepare_numeric_matrix(df: pd.DataFrame, feature_cols: Optional[Sequence[str]] = None) -> Tuple[np.ndarray, List[str]]:
+    """
+    Build a clean numeric matrix:
+      - select numeric feature columns,
+      - coerce to float64,
+      - replace non-finite with column medians,
+      - standardize (z-score),
+      - clip to [-_NUM_CLIP, _NUM_CLIP].
+    """
+    cols = _select_numeric_columns(df, feature_cols)
+    if not cols:
+        raise ValueError("No numeric feature columns found for clustering.")
+
+    X = df[cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+
+    # replace non-finite with column medians
+    finite_mask = np.isfinite(X)
+    if not finite_mask.all():
+        col_median = np.nanmedian(np.where(finite_mask, X, np.nan), axis=0)
+        # if any column is all-NaN, set its median to 0
+        col_median = np.where(np.isfinite(col_median), col_median, 0.0)
+        inds = np.where(~finite_mask)
+        X[inds] = col_median[inds[1]]
+
+    # standardize
+    mean = X.mean(axis=0)
+    std = X.std(axis=0)
+    std[std == 0] = 1.0
+    X = (X - mean) / std
+
+    # clip
+    X = np.clip(X, -_NUM_CLIP, _NUM_CLIP)
+
+    return X, cols
+
+
+def _safe_sqeuclidean(X: np.ndarray, Y: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Numerically safer squared Euclidean distance:
+      d^2 = ||x||^2 + ||y||^2 - 2 x·y
+    - force float64
+    - handle non-finite by mapping to large distances
+    - ensure non-negative due to numerical noise
+    """
     if Y is None:
         Y = X
-    # (n,d) · (m,d) -> (n,m)
-    a2 = (X**2).sum(axis=1, keepdims=True)
-    b2 = (Y**2).sum(axis=1, keepdims=True).T
-    dist2 = a2 + b2 - 2.0 * X @ Y.T
+    X = np.ascontiguousarray(X, dtype=np.float64)
+    Y = np.ascontiguousarray(Y, dtype=np.float64)
+
+    # compute squared norms via einsum to avoid overflow patterns
+    a2 = np.einsum("ij,ij->i", X, X)[:, None]
+    b2 = np.einsum("ij,ij->i", Y, Y)[None, :]
+
+    K = X @ Y.T  # this is where overflow used to happen
+    # guard: if any non-finite sneaks in, set to 0 inner product (maximizes distance via a2+b2)
+    K[~np.isfinite(K)] = 0.0
+
+    dist2 = a2 + b2 - 2.0 * K
+    # Replace non-finite distances with +inf
+    dist2[~np.isfinite(dist2)] = np.inf
+    # Numerical floor at zero
     np.maximum(dist2, 0.0, out=dist2)
-    return np.sqrt(dist2, out=dist2)
+    return dist2
 
 
-def kmedoids(
-    X: np.ndarray,
-    k: int,
-    max_iter: int = 100,
-    seed: int = 0,
-    sample_weight: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Lightweight k-medoids (PAM-lite) in pure NumPy.
+# -------------------------------
+# K-means (Lloyd) with k-means++ init
+# -------------------------------
 
-    Returns
-    -------
-    medoid_idx : (k,) indices into X
-    labels     : (n,) cluster assignment in [0,k-1]
-    """
+def _kmeans_pp_init(X: np.ndarray, k: int, rng: np.random.Generator) -> np.ndarray:
     n = X.shape[0]
-    if k <= 0 or k > n:
-        raise ValueError("Invalid k for k-medoids.")
+    centers = []
+    # pick first center
+    i0 = int(rng.integers(0, n))
+    centers.append(X[i0])
+    # pick rest
+    for _ in range(1, k):
+        dist2 = _safe_sqeuclidean(X, np.vstack(centers)).min(axis=1)
+        probs = dist2 / (dist2.sum() + 1e-12)
+        idx = int(rng.choice(n, p=probs))
+        centers.append(X[idx])
+    return np.vstack(centers)
+
+
+def _kmeans(X: np.ndarray, k: int, seed: int = 0, max_iter: int = 100, tol: float = 1e-4) -> Tuple[np.ndarray, np.ndarray]:
+    n = X.shape[0]
     rng = np.random.default_rng(seed)
-    medoid_idx = rng.choice(n, size=k, replace=False)
-    D = _euclidean_cdist(X)  # (n,n)
-    w = sample_weight if sample_weight is not None else np.ones(n, dtype=float)
+    k = min(k, n)  # guard
+
+    C = _kmeans_pp_init(X, k, rng)
+    labels = np.zeros(n, dtype=int)
 
     for _ in range(max_iter):
-        # assign
-        M = D[:, medoid_idx]  # (n,k)
-        labels = M.argmin(axis=1)
-
-        # update medoids for each cluster
-        new_medoid_idx = medoid_idx.copy()
-        changed = False
+        d2 = _safe_sqeuclidean(X, C)
+        new_labels = d2.argmin(axis=1)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
         for j in range(k):
-            members = np.where(labels == j)[0]
-            if len(members) == 0:
-                continue
-            # choose member minimizing weighted sum of distances to other members
-            subD = D[np.ix_(members, members)]
-            subw = w[members]
-            # cost_i = sum_l w_l * dist(i,l)
-            cost = (subD * subw[None, :]).sum(axis=1)
-            best_local = members[cost.argmin()]
-            if best_local != medoid_idx[j]:
-                new_medoid_idx[j] = best_local
-                changed = True
+            mask = labels == j
+            if not np.any(mask):
+                # re-seed empty cluster
+                C[j] = X[int(rng.integers(0, n))]
+            else:
+                C[j] = X[mask].mean(axis=0)
+    return labels, C
 
-        medoid_idx = new_medoid_idx
-        if not changed:
+
+# -------------------------------
+# K-medoids (PAM-lite)
+# -------------------------------
+
+def _pam(X: np.ndarray, k: int, seed: int = 0, max_iter: int = 100) -> Tuple[np.ndarray, np.ndarray]:
+    n = X.shape[0]
+    rng = np.random.default_rng(seed)
+    k = min(k, n)  # guard
+
+    # initialize medoids by random unique indices
+    medoid_idx = rng.choice(n, size=k, replace=False)
+    D = _safe_sqeuclidean(X)  # full distance matrix
+
+    def total_cost(med_idx: np.ndarray) -> float:
+        dmin = D[:, med_idx].min(axis=1)
+        return float(dmin.sum())
+
+    best_cost = total_cost(medoid_idx)
+
+    for _ in range(max_iter):
+        improved = False
+        for i in range(k):
+            for h in range(n):
+                if h in medoid_idx:
+                    continue
+                new_idx = medoid_idx.copy()
+                new_idx[i] = h
+                c = total_cost(new_idx)
+                if c + 1e-9 < best_cost:
+                    best_cost = c
+                    medoid_idx = new_idx
+                    improved = True
+        if not improved:
             break
 
-    # final assignment
+    # assign labels
     labels = D[:, medoid_idx].argmin(axis=1)
-    return medoid_idx, labels
+    medoids = X[medoid_idx]
+    return labels, medoids
 
 
 # -------------------------------
 # Public API
 # -------------------------------
 
-@dataclass
-class ClusterConfig:
-    method: str = "kmedoids"          # "kmedoids" or "kmeans"
-    k: int = 8
-    seed: int = 0
-    beta_logq: float = 0.2            # for ranking S = E_A - beta*log q
-    temperature: float = 1.0          # for weight w = q * exp(-E_A/T)
-    feature_cols: Tuple[str, ...] = ("E_A", "E_clash", "E_mj", "R_g", "clash_cnt", "contact_cnt")
-
-
-def cluster_group(
-    gdf: pd.DataFrame,
+def cluster_dataframe(
+    df: pd.DataFrame,
     cfg: ClusterConfig,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    feature_cols: Optional[Sequence[str]] = None,
+) -> Tuple[pd.Series, np.ndarray, List[str]]:
     """
-    Cluster a single group's samples and produce:
-      - clusters_df: gdf with added columns [cluster, is_medoid, is_minE, S, weight]
-      - reps_df: representatives per cluster (medoid + minE; deduped)
-      - stats_df: per-cluster summary statistics
+    Cluster rows of df using selected numeric features.
+
+    Returns
+    -------
+    labels : pd.Series of shape (n,)
+    centers : np.ndarray of shape (k, d)  (means or medoids)
+    used_features : list of column names actually used
     """
-    df = gdf.copy()
+    # build cleaned numeric matrix
+    X, used = _prepare_numeric_matrix(df, feature_cols)
 
-    # weights and ranking score
-    q = df["q_prob"].to_numpy(dtype=float)
-    E = df["E_A"].to_numpy(dtype=float)
-    w = q * np.exp(-E / max(1e-9, float(cfg.temperature)))
-    w = w / (w.sum() + 1e-12)
-    df["weight"] = w
-    df["S"] = df["E_A"] - cfg.beta_logq * np.log(df["q_prob"].to_numpy(dtype=float) + 1e-12)
+    # handle degenerate cases
+    n = X.shape[0]
+    if n == 0:
+        raise ValueError("Empty matrix after cleaning.")
+    k = max(1, min(cfg.k, n))
 
-    # features
-    X = df.loc[:, list(cfg.feature_cols)].to_numpy(dtype=float)
-    # standardize (z-score)
-    mu = X.mean(axis=0, keepdims=True)
-    sd = X.std(axis=0, keepdims=True) + 1e-12
-    Z = (X - mu) / sd
+    # if all features are constant after cleaning, skip clustering
+    if np.allclose(X.std(axis=0), 0.0):
+        labels = np.zeros(n, dtype=int)
+        centers = X[:1].copy()
+        return pd.Series(labels, index=df.index, name="cluster"), centers, used
 
-    # choose method
-    method = cfg.method.lower()
-    labels: np.ndarray
-    medoid_idx: np.ndarray
-    if method == "kmedoids":
-        medoid_idx, labels = kmedoids(Z, k=min(cfg.k, len(df)), seed=cfg.seed, sample_weight=w)
-    elif method == "kmeans":
-        try:
-            from sklearn.cluster import KMeans
-            km = KMeans(n_clusters=min(cfg.k, len(df)), n_init="auto", random_state=cfg.seed)
-            labels = km.fit_predict(Z)
-            # pseudo-medoid: closest to centroid
-            centers = km.cluster_centers_
-            D = _euclidean_cdist(Z, centers)
-            medoid_idx = np.array([np.where(labels == j)[0][D[labels == j, j].argmin()]
-                                   if (labels == j).any() else -1
-                                   for j in range(centers.shape[0])])
-        except Exception:
-            # fallback to kmedoids
-            medoid_idx, labels = kmedoids(Z, k=min(cfg.k, len(df)), seed=cfg.seed, sample_weight=w)
-            method = "kmedoids"
+    # run chosen method
+    if cfg.method.lower() == "kmeans":
+        labels, centers = _kmeans(X, k=k, seed=cfg.seed)
     else:
-        raise ValueError("Unknown clustering method.")
+        labels, centers = _pam(X, k=k, seed=cfg.seed)
 
-    df["cluster"] = labels
-
-    # representatives: medoid & min-E per cluster
-    medoid_mask = np.zeros(len(df), dtype=bool)
-    minE_mask = np.zeros(len(df), dtype=bool)
-    for j in np.unique(labels):
-        members = np.where(labels == j)[0]
-        if len(members) == 0:
-            continue
-        # medoid
-        # find index == medoid_idx[j], but medoid_idx may be -1 for empty cluster w/ kmeans
-        m_idx = medoid_idx[j] if j < len(medoid_idx) and medoid_idx[j] >= 0 else None
-        if m_idx is not None and m_idx in members:
-            medoid_mask[m_idx] = True
-        # min-E
-        m2 = members[E[members].argmin()]
-        minE_mask[m2] = True
-
-    df["is_medoid"] = medoid_mask
-    df["is_minE"] = minE_mask
-
-    # build reps_df (dedupe overlaps)
-    reps_df = df[df["is_medoid"] | df["is_minE"]].copy()
-    reps_df = reps_df.drop_duplicates(subset=["bitstring"])
-
-    # stats per cluster
-    stats = []
-    for j in sorted(np.unique(labels)):
-        g = df[df["cluster"] == j]
-        if len(g) == 0:
-            continue
-        stats.append({
-            "cluster": j,
-            "size": len(g),
-            "E_A_med": float(g["E_A"].median()),
-            "E_A_min": float(g["E_A"].min()),
-            "E_A_max": float(g["E_A"].max()),
-            "q_prob_sum": float(g["q_prob"].sum()),
-            "weight_sum": float(g["weight"].sum()),
-            "S_med": float(g["S"].median()),
-        })
-    stats_df = pd.DataFrame(stats).sort_values("cluster").reset_index(drop=True)
-
-    return df, reps_df, stats_df
+    return pd.Series(labels, index=df.index, name="cluster"), centers, used
 
 
-def select_topK_per_group(
-    gdf: pd.DataFrame,
-    K: int = 5,
+def pick_representatives(
+    df: pd.DataFrame,
+    labels: pd.Series,
     per_cluster_max: int = 2,
+    score_cols: Optional[Sequence[str]] = None,
+    beta_logq: float = 0.2,
 ) -> pd.DataFrame:
     """
-    Final selection: sort by S ascending, take at most `per_cluster_max` per cluster, up to K total.
+    Pick representative rows per cluster by a score.
+    Default score: S = E_A - beta_logq * log(q_prob)
     """
-    out = []
-    counts = {}
-    for _, row in gdf.sort_values("S", ascending=True).iterrows():
-        c = int(row["cluster"])
-        if counts.get(c, 0) >= per_cluster_max:
-            continue
-        out.append(row)
-        counts[c] = counts.get(c, 0) + 1
-        if len(out) >= K:
-            break
-    return pd.DataFrame(out)
+    work = df.copy()
+    work["cluster"] = labels.values
+
+    # default score columns
+    if score_cols is None:
+        score_cols = ["E_A"]
+
+    # build score
+    work = work.copy()
+    # safe log(q): replace non-positive with tiny epsilon
+    q = pd.to_numeric(work.get("q_prob", 1.0), errors="coerce").fillna(1.0)
+    q = q.clip(lower=1e-300)
+    score = pd.to_numeric(work.get("E_A", 0.0), errors="coerce").fillna(0.0) - beta_logq * np.log(q)
+    work["__score__"] = score.replace([np.inf, -np.inf], np.nan).fillna(1e9)
+
+    reps = []
+    for c, g in work.groupby("cluster"):
+        g_sorted = g.sort_values("__score__").head(per_cluster_max)
+        reps.append(g_sorted)
+    out = pd.concat(reps, ignore_index=True).drop(columns=["__score__"])
+    return out
