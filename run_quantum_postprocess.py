@@ -127,6 +127,5 @@ def main():
     print(f"    Reports (PDF) :  {OUTPUT_DIR / 'analysis' / 'reports'}")
     print(f"    TopK XYZ     :   {OUTPUT_DIR / 'rep_structures'}")
 
-
 if __name__ == "__main__":
     main()
