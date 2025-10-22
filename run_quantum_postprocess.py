@@ -93,9 +93,11 @@ def main():
         return
 
     cluster_cfg = ClusterConfig(
-        method="kmeans",
-        seed=42,
+        method="kmedoids",
+        n_clusters=8,
+        per_cluster_max=3,
         beta_logq=0.2,
+        seed=0,
     )
 
     weights = TierAWeights(
