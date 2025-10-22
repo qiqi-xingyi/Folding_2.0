@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 from qiskit import QuantumCircuit
 from qiskit.quantum_info import SparsePauliOp
+from qiskit import transpile
 
 # EfficientSU2 import
 try:
@@ -66,5 +67,23 @@ def make_sampling_circuit(
     circ.measure_all()
     return circ
 
+def expand_high_level(circ: QuantumCircuit) -> QuantumCircuit:
+    """
+    Expand library gates (e.g., EfficientSU2, PauliEvolutionGate) into basic gates.
+    Multiple reps helps descend nested library gates.
+    """
+    return circ.decompose(reps=3)
+
+def lower_for_sim(circ: QuantumCircuit) -> QuantumCircuit:
+    """
+    Lower to a common IBM-like basis for local simulators without routing.
+    """
+    circ = expand_high_level(circ)
+    return transpile(
+        circ,
+        basis_gates=["rz", "sx", "x", "cx"],
+        optimization_level=1,
+        coupling_map=None,
+    )
 
 
