@@ -207,7 +207,6 @@ def run_full_pipeline(
 
             reps = select_topK_per_group(
                 assign.merge(feat_df[["bitstring", "coords"]], on="bitstring", how="left"),
-                topK=topK_per_group,
                 per_cluster_max=per_cluster_max,
                 beta_logq=cluster_cfg.beta_logq,
             )
