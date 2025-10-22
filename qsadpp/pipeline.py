@@ -27,7 +27,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-import numpy as np
 import pandas as pd
 
 from .io import read_samples, aggregate_counts_to_prob, iter_groups, save_parquet, save_csv, GROUP_KEYS
