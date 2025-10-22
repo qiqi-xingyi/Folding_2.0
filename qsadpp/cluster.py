@@ -21,7 +21,6 @@ class ClusterConfig:
     beta_logq: float = 0.2     # used later for scoring S = E_A - beta*log(q)
     temperature: float = 1.0   # not used here directly
 
-
 # -------------------------------
 # Numeric matrix preparation
 # -------------------------------
