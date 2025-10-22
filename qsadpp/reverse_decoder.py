@@ -147,7 +147,8 @@ class ReverseDecoder:
 
         if not hasattr(problem, "interpret"):
             raise AttributeError("Problem object must provide an .interpret(binary_probs) method.")
-        pf_result = problem.interpret({bitstring: 1.0})
+        # pf_result = problem.interpret({bitstring: 1.0})
+        pf_result = problem.interpret({"bitstring": bitstring, "prob": 1.0})
 
         getter = calpha_getter or self.calpha_getter or safe_get_calpha_coords
         ca = getter(pf_result)
