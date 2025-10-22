@@ -82,29 +82,34 @@ def _features_for_group(
     bitstrings = df_group["bitstring"].astype(str).tolist()
     probs = pd.to_numeric(df_group["prob"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
 
-    # -- Decode all to coords (Cα only) --
+    # Decode to coordinates (Cα only)
     problem = meta["__problem__"]
     coords_list: List[np.ndarray] = []
     for b in bitstrings:
         try:
             coords = _decode_one_coords(problem, b)
         except Exception:
-            # fall back to NaN entry if decoding fails; will be dropped later
-            coords = np.full((int(meta["L"]), 3), np.nan, dtype=float)
+            coords = np.full((int(meta.get("L", 0) or len(str(meta.get("sequence", "")))), 3), np.nan, dtype=float)
         coords_list.append(coords)
 
-    # -- Compute Tier-A features --
-    features = compute_tierA_features(
-        coords_list=coords_list,
-        sequence=str(meta["sequence"]),
-        probs=probs,
-        mj_table=mj_table,
-        weights=weights,
-    )
+    # Per-conformation Tier-A features
+    rows: List[Dict[str, object]] = []
+    seq = str(meta.get("sequence", ""))
+    for b, q, ca in zip(bitstrings, probs, coords_list):
+        try:
+            feats = compute_tierA_features(sequence=seq, ca_coords=ca, mj_table=mj_table, weights=weights)
+        except Exception:
+            feats = dict(E_A=np.nan, E_clash=np.nan, E_mj=np.nan, R_g=np.nan, clash_cnt=0, contact_cnt=0)
+        feats.update(bitstring=b, q_prob=float(q), coords=ca)
+        rows.append(feats)
+
+    features = pd.DataFrame(rows)
+
     # attach metadata columns
     for k in ["protein", "sequence", "label", "backend", "ibm_backend", "beta", "seed", "circuit_hash", "L"]:
         features[k] = meta.get(k, None)
     return features, {"decoded_ok": True}
+
 
 
 def _save_topK_xyz(
