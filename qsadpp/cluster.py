@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -21,10 +21,26 @@ class ClusterConfig:
     seed: int = 0
     beta_logq: float = 0.2
     temperature: float = 1.0
+    # backward-compat alias for older scripts that passed `n_clusters=...`
+    n_clusters: Optional[int] = None
 
     def __post_init__(self):
-        if self.n_clusters is not None and self.k == ClusterConfig.__dataclass_fields__["k"].default:
+        # adopt n_clusters if provided and k is still at its default
+        default_k = type(self).__dataclass_fields__["k"].default
+        if self.n_clusters is not None and self.k == default_k:
             self.k = int(self.n_clusters)
+
+        self.method = str(self.method).lower()
+        if self.method not in ("kmedoids", "kmeans"):
+            raise ValueError("method must be 'kmedoids' or 'kmeans'")
+
+        self.k = int(self.k)
+        if self.k <= 0:
+            raise ValueError("k must be a positive integer")
+
+        self.seed = int(self.seed)
+        self.beta_logq = float(self.beta_logq)
+        self.temperature = float(self.temperature)
 
 
 _NUM_CLIP = 1e6  # clip to avoid overflow in dot products
@@ -36,6 +52,7 @@ def _select_numeric_columns(df: pd.DataFrame, candidate_cols: Optional[Sequence[
     cols = [c for c in candidate_cols if c in df.columns]
     num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
     return num_cols
+
 
 
 def _prepare_numeric_matrix(df: pd.DataFrame, feature_cols: Optional[Sequence[str]] = None) -> Tuple[np.ndarray, List[str]]:
