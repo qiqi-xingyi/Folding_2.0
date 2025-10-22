@@ -4,11 +4,19 @@
 # @Email : yzhan135@kent.edu
 # @File:beck.py
 
+# --*-- coding:utf-8 --*--
+# @time:10/19/25 10:12
+# @Author : Yuqi Zhang
+# @Email : yzhan135@kent.edu
+# @File:beck.py
+
 from __future__ import annotations
-from typing import Dict, Optional, List
-import warnings
+from typing import Dict, Optional
 
 from qiskit import QuantumCircuit, transpile
+
+# Import circuit lowering helpers
+from .circuits import expand_high_level, lower_for_sim
 
 # Local simulator: AerSimulator
 try:
@@ -86,8 +94,6 @@ class LocalSimulatorBackend(SamplerBackend):
                 "No local simulation path available. Install qiskit-aer or ensure qiskit.quantum_info.Statevector is present."
             )
         self._mode = "aer" if AerSimulator is not None else "statevector"
-        print(f"[LocalSimulatorBackend] mode = {self._mode}")
-
         if self._mode == "aer":
             self._sim = AerSimulator()
             self._seed_kw = {"seed_simulator": int(self.seed)} if self.seed is not None else {}
@@ -96,18 +102,26 @@ class LocalSimulatorBackend(SamplerBackend):
 
     def run_counts(self, circuit: QuantumCircuit) -> Dict[str, int]:
         if self._mode == "statevector":
-            # Ensure measurement mapping consistency: emulate measure_all() ordering
-            unitary = self._strip_final_measurements(circuit)
+            # Expand library gates and remove measurements
+            unitary = expand_high_level(circuit)
+            try:
+                unitary = unitary.remove_final_measurements(inplace=False)
+            except Exception:
+                qc = QuantumCircuit(circuit.num_qubits)
+                for instr, qargs, cargs in unitary.data:
+                    if instr.name.lower() == "measure":
+                        continue
+                    qc.append(instr, qargs, cargs)
+                unitary = qc
             sv = Statevector.from_instruction(unitary)
-            probs = sv.probabilities_dict()  # keys in computational basis
+            probs = sv.probabilities_dict()
             counts = {b: int(round(float(p) * self.shots)) for b, p in probs.items() if float(p) > 0.0}
-            counts = _normalize_counts_to_total(counts, self.shots)
-            # If your Aer/IBM path uses different endianness, toggle bit reverse here:
-            # counts = { _bit_reverse(k): v for k, v in counts.items() }
-            return counts
+            return _normalize_counts_to_total(counts, self.shots)
 
+        # Aer path: lower to a common basis without routing
+        lowered = lower_for_sim(circuit)
         tqc = transpile(
-            circuit,
+            lowered,
             self._sim,
             optimization_level=1,
             seed_transpiler=self.seed if self.seed is not None else None,
@@ -119,27 +133,10 @@ class LocalSimulatorBackend(SamplerBackend):
             counts = counts[0]
         return _normalize_counts_to_total(dict(counts), self.shots)
 
-    @staticmethod
-    def _strip_final_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
-        """
-        Remove final measurements; this assumes there are no conditional gates
-        depending on classical bits. For sampling circuits, this is typically safe.
-        """
-        try:
-            return circuit.remove_final_measurements(inplace=False)
-        except Exception:
-            qc = QuantumCircuit(circuit.num_qubits)
-            for instr, qargs, cargs in circuit.data:
-                if instr.name.lower() == "measure":
-                    continue
-                qc.append(instr, qargs, cargs)
-            return qc
-
 
 class IBMSamplerBackend(SamplerBackend):
     """
-    IBM Runtime SamplerV2 backend with robust result parsing.
-    Uses Session(backend=...) and passes the session via mode=...
+    IBM Runtime SamplerV2 backend with explicit lowering and routing to the target backend.
     """
     def __init__(self, shots: int, backend_name: Optional[str]):
         super().__init__(shots)
@@ -149,26 +146,20 @@ class IBMSamplerBackend(SamplerBackend):
             raise RuntimeError("qiskit-ibm-runtime must be installed to use IBM backends.") from e
 
         self._service = QiskitRuntimeService()
-        # Resolve backend
         if backend_name:
             backend = self._service.backend(backend_name)
         else:
-            # Fallback to a least-busy real backend if none provided
             backend = self._service.least_busy(operational=True, simulator=False)
-
-        # Create a persistent session bound to the chosen backend
+        self._backend = backend
         self._session = Session(backend=backend)
-
-        # Create the Sampler primitive; pass the session via 'mode'
         self._sampler = SamplerV2(
             mode=self._session,
             options={
-                "default_shots": shots,  # used if 'shots' not provided at run()
+                "default_shots": shots,
             },
         )
 
     def __del__(self):
-        # Best-effort cleanup of the session
         try:
             if hasattr(self, "_session") and self._session is not None:
                 self._session.close()
@@ -176,20 +167,21 @@ class IBMSamplerBackend(SamplerBackend):
             pass
 
     def run_counts(self, circuit: QuantumCircuit) -> Dict[str, int]:
-        # You can pass 'shots' explicitly; otherwise default_shots is used.
-        job = self._sampler.run([circuit], shots=self.shots)
+        # Expand library gates and then transpile to the target backend's native gate set and coupling map
+        lowered = expand_high_level(circuit)
+        tcirc = transpile(lowered, backend=self._backend, optimization_level=1)
+
+        job = self._sampler.run([tcirc], shots=self.shots)
         result = job.result()
         pub = result[0]
         data = pub.data
 
-        # Path A: classical register access, e.g. data.cr.get_counts()
+        # Path A: data.<reg>.get_counts()
         try:
-            # Prefer a register named 'cr' if present
             cr = getattr(data, "cr", None)
             if cr is not None and hasattr(cr, "get_counts"):
                 counts = dict(cr.get_counts())
                 return _normalize_counts_to_total(counts, self.shots)
-            # Otherwise, search any attribute that exposes get_counts()
             for name in dir(data):
                 obj = getattr(data, name)
                 if hasattr(obj, "get_counts"):
@@ -198,7 +190,7 @@ class IBMSamplerBackend(SamplerBackend):
         except Exception:
             pass
 
-        # Path B: explicit samples
+        # Path B: data.samples
         try:
             samples = getattr(data, "samples", None)
             if samples is not None:
@@ -210,7 +202,7 @@ class IBMSamplerBackend(SamplerBackend):
         except Exception:
             pass
 
-        # Path C: quasi distributions
+        # Path C: data.quasi_dists / data.quasi_dist
         try:
             quasi = getattr(data, "quasi_dists", None)
             if quasi is None:
@@ -221,7 +213,7 @@ class IBMSamplerBackend(SamplerBackend):
         except Exception:
             pass
 
-        # Path D: rare 'meas.get_counts()' container
+        # Path D: data.meas.get_counts()
         try:
             meas = getattr(data, "meas", None)
             if meas is not None and hasattr(meas, "get_counts"):
@@ -233,7 +225,6 @@ class IBMSamplerBackend(SamplerBackend):
         raise RuntimeError("Unsupported SamplerV2 result format; cannot extract counts.")
 
 
-
 def make_backend(kind: str, shots: int, seed_sim: Optional[int], ibm_backend: Optional[str]) -> SamplerBackend:
     kind = (kind or "simulator").lower()
     if kind == "simulator":
@@ -242,3 +233,4 @@ def make_backend(kind: str, shots: int, seed_sim: Optional[int], ibm_backend: Op
         return IBMSamplerBackend(shots=shots, backend_name=ibm_backend)
     else:
         raise ValueError(f"Unknown backend kind: {kind}")
+
