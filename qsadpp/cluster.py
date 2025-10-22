@@ -264,3 +264,35 @@ def pick_representatives(
         reps.append(g_sorted)
     out = pd.concat(reps, ignore_index=True).drop(columns=["__score__"])
     return out
+
+# ---- Backward compatibility wrappers (keep old API names) ----
+
+def cluster_group(
+    df: pd.DataFrame,
+    cfg: ClusterConfig,
+    feature_cols: Optional[Sequence[str]] = None,
+):
+    """
+    Backward-compatible wrapper for old API name.
+    Delegates to cluster_dataframe.
+    Returns (labels, centers, used_features).
+    """
+    return cluster_dataframe(df, cfg, feature_cols)
+
+
+def select_topK_per_group(
+    df: pd.DataFrame,
+    labels: pd.Series,
+    per_cluster_max: int = 2,
+    beta_logq: float = 0.2,
+):
+    """
+    Backward-compatible wrapper for old API name.
+    Delegates to pick_representatives.
+    """
+    return pick_representatives(
+        df,
+        labels,
+        per_cluster_max=per_cluster_max,
+        beta_logq=beta_logq,
+    )
