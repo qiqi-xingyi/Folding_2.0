@@ -67,7 +67,6 @@ class OrchestratorConfig:
         weights={"steric": 1.0, "geom": 0.5, "bond": 0.2, "mj": 1.0},
         normalize=True,
         output_path="__unused__.jsonl",  # will be overridden per group
-        mj_path="mj_matrix.txt",
     ))
 
     # Decode defaults (bitstring->turns->coords)
