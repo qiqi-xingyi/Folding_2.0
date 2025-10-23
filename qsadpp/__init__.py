@@ -1,49 +1,30 @@
 # --*-- conding:utf-8 --*--
-# @time:10/21/25 13:33
+# @time:10/22/25 21:21
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
 # @File:__init__.py.py
 
 # --*-- coding:utf-8 --*--
 # qsadpp/__init__.py
+"""
+Minimal, end-to-end post-processing toolkit:
+1) SamplingReader   - read/parse quantum sampling CSV
+2) StructureMapper  - bitstring -> coarse Cα coordinates (2D lattice, z=0)
+3) EnergyCalculator - structural pseudo-energy + Ising-like Hamiltonian
+4) ClusterAnalyzer  - clustering and lowest-energy cluster selection
+5) StructureFitter  - weighted averaging in the best cluster and save XYZ/CSV
+"""
 
-from .io import (
-    load_all_samples,
-    load_mj_matrix,
-    normalize_counts_to_prob_within,
-    expand_bitstrings,
-    ensure_standard_columns,
-)
-from .features import (
-    compute_tierA_features,
-    compute_features_for_group,
-    TierAWeights,
-    pairwise_distances,
-    radius_of_gyration,
-)
-from .decoder import ProteinShapeDecoder
-from .reverse_decoder import (
-    ReverseDecoder,
-    batch_decode_vectors,
-    batch_decode_coords_via_problem,
-)
-from .cluster import ClusterConfig, cluster_group, select_topK_per_group
-from .data import get_mj_table
-from .utils import write_xyz_ca
+from .reader import SamplingReader
+from .mapper import StructureMapper
+from .energy import EnergyCalculator
+from .clusterer import ClusterAnalyzer
+from .fitter import StructureFitter
 
 __all__ = [
-    # io
-    "load_all_samples", "load_mj_matrix", "normalize_counts_to_prob_within",
-    "expand_bitstrings", "ensure_standard_columns",
-    # features
-    "compute_tierA_features", "compute_features_for_group", "TierAWeights",
-    "pairwise_distances", "radius_of_gyration",
-    # decoder & reverse
-    "ProteinShapeDecoder", "ReverseDecoder",
-    "batch_decode_vectors", "batch_decode_coords_via_problem",
-    # cluster
-    "ClusterConfig", "cluster_group", "select_topK_per_group",
-    # data/utils
-    "get_mj_table", "write_xyz_ca",
+    "SamplingReader",
+    "StructureMapper",
+    "EnergyCalculator",
+    "ClusterAnalyzer",
+    "StructureFitter",
 ]
-
