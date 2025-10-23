@@ -17,14 +17,12 @@ cfg = OrchestratorConfig(
     ),
     fifth_bit=False,
     out_dir="e_results",
-    decoded_all_path="decoded_all.jsonl",
-    energy_all_path="energies_all.jsonl",
     decoder_output_format="jsonl",
+    aggregate_only=True,
 )
 
-
-if __name__ == '__main__':
-
+if __name__ == "__main__":
     runner = PipelineOrchestrator(cfg)
     summary = runner.run()
     print(summary)
+
