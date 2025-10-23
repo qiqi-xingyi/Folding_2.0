@@ -279,7 +279,7 @@ class SampleReader:
                     continue
 
                 # Group within the chunk by (protein, label, group_id)
-                gb = chunk.groupby(["protein", "label", "group_id"], sort=False)
+                gb = chunk.groupby(["protein", "label", "group_id"], sort=False, observed=False)
                 for key, part in gb:
                     # Initialize buffer and counts
                     if key not in buffers:
