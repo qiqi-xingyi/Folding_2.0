@@ -5,16 +5,18 @@
 # @File:energy_calculator.py
 
 from __future__ import annotations
+import os
 import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 import numpy as np
-import pandas as pd
 
 _LOG = logging.getLogger(__name__)
 if not _LOG.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+
+_MJ_MATRIX_PATH = os.path.join(os.path.dirname(__file__), "mj_matrix.txt")
 
 
 @dataclass
@@ -28,36 +30,38 @@ class EnergyConfig:
     )
     normalize: bool = True
     output_path: str = "decoded_with_energy.jsonl"
-    mj_path: Optional[str] = "mj_matrix.txt"
 
 
 class LatticeEnergyCalculator:
     """
     Compute approximate conformational energy for main-chain-only lattice proteins
     with an additional MJ contact potential.
+    The MJ matrix is always loaded from qsadpp/mj_matrix.txt.
     """
 
     def __init__(self, cfg: EnergyConfig = EnergyConfig()):
         self.cfg = cfg
-        self._mj_matrix, self._aa_index = self._load_mj_matrix(cfg.mj_path)
+        self._mj_matrix, self._aa_index = self._load_mj_matrix()
 
     # ---------------- MJ Matrix ----------------
-    def _load_mj_matrix(self, path: Optional[str]) -> tuple[np.ndarray, Dict[str, int]]:
-        if path is None or not path or not isinstance(path, str):
-            _LOG.warning("No MJ matrix provided; E_MJ will be 0 for all conformations.")
+    def _load_mj_matrix(self) -> tuple[np.ndarray, Dict[str, int]]:
+        """Load MJ matrix from the fixed package path."""
+        path = _MJ_MATRIX_PATH
+        if not os.path.exists(path):
+            _LOG.warning("MJ matrix not found in package: %s; all E_MJ=0", path)
             return np.zeros((20, 20)), {}
 
         with open(path, "r") as f:
-            lines = [l.strip() for l in f.readlines() if l.strip()]
+            lines = [l.strip() for l in f if l.strip()]
         headers = lines[0].split()
         mat = np.zeros((len(headers), len(headers)))
         for i, line in enumerate(lines[1:]):
             vals = [float(x) for x in line.split()]
             for j in range(len(vals)):
                 mat[i, j] = vals[j]
-                mat[j, i] = vals[j]  # ensure symmetry
+                mat[j, i] = vals[j]
         aa_index = {aa: i for i, aa in enumerate(headers)}
-        _LOG.info("Loaded MJ matrix with %d amino acids", len(aa_index))
+        _LOG.info("Loaded MJ matrix from package: %s (%d residues)", path, len(aa_index))
         return mat, aa_index
 
     # ---------------- Energy Components ----------------
@@ -72,8 +76,7 @@ class LatticeEnergyCalculator:
         E_bond = np.sum((bond_lengths - self.cfg.d0) ** 2)
 
         # 2. geometric energy
-        v1 = v[:-1]
-        v2 = v[1:]
+        v1, v2 = v[:-1], v[1:]
         cos_thetas = np.sum(v1 * v2, axis=1) / (
             np.linalg.norm(v1, axis=1) * np.linalg.norm(v2, axis=1)
         )
@@ -90,22 +93,18 @@ class LatticeEnergyCalculator:
 
         # 4. MJ contact energy
         E_mj = 0.0
-        if self._mj_matrix is not None and len(self._aa_index) > 0:
+        if len(self._aa_index) > 0:
             for i in range(N - 1):
-                aa_i = sequence[i]
-                idx_i = self._aa_index.get(aa_i, None)
-                if idx_i is None:
+                ai = self._aa_index.get(sequence[i])
+                if ai is None:
                     continue
-                for j in range(i + 2, N):  # exclude |i-j| <= 1
-                    aa_j = sequence[j]
-                    idx_j = self._aa_index.get(aa_j, None)
-                    if idx_j is None:
+                for j in range(i + 2, N):  # skip bonded pairs
+                    aj = self._aa_index.get(sequence[j])
+                    if aj is None:
                         continue
-                    d = dist[i, j]
-                    if d <= self.cfg.r_contact:
-                        E_mj += self._mj_matrix[idx_i, idx_j]
+                    if dist[i, j] <= self.cfg.r_contact:
+                        E_mj += self._mj_matrix[ai, aj]
 
-        # weighted sum
         w = self.cfg.weights
         E_total = (
             w["steric"] * E_steric
@@ -113,7 +112,6 @@ class LatticeEnergyCalculator:
             + w["bond"] * E_bond
             + w["mj"] * E_mj
         )
-
         if self.cfg.normalize:
             E_total /= N
 
