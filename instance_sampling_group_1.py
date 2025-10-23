@@ -24,7 +24,7 @@ IBM_CONFIG_FILE = "./ibm_config.txt"
 TASKS_FILE = "./tasks.csv"
 
 PENALTY_PARAMS: Tuple[int, int, int] = (10, 10, 10)
-BETA_LIST: List[float] = [0.0, 0.5, 1.0, 2.0, 3.0]
+BETA_LIST: List[float] = [1.0, 2.0, 3.0]
 SEEDS: int = 4
 REPS: int = 1
 

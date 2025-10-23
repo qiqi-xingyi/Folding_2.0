@@ -85,5 +85,3 @@ def lower_for_sim(circ: QuantumCircuit) -> QuantumCircuit:
         optimization_level=1,
         coupling_map=None,
     )
-
-
