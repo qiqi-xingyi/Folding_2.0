@@ -4,7 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:fitter.py
 
-
 from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
