@@ -1,6 +1,6 @@
 # --*-- coding:utf-8 --*--
 # @time: 10/22/25
-# @Author: Yuqi Zhang (edited by ChatGPT)
+# @Author: Yuqi Zhang
 # @File: run_quantum_postprocess.py
 
 from __future__ import annotations
