@@ -33,123 +33,122 @@ def _ensure_dir(path: str) -> None:
 @dataclass
 class OrchestratorConfig:
     """
-    End-to-end pipeline configuration for:
-      read -> per-group decode -> per-group energy -> optional global aggregation.
+    End-to-end pipeline:
+      read -> per-group decode -> per-group energy -> aggregate per PDB.
 
     Notes:
-    - For main-chain only, side_chain_hot_vector will be inferred as [False] * len(sequence)
-      by default via `side_chain_hot_builder`. You can override it with a custom builder.
-    - fifth_bit default is False; set to True if your problem encoding requires it.
+      - We assume all CSVs under `pdb_dir` belong to the same protein (pdbid).
+      - For main-chain only, side_chain_hot_builder defaults to all-False of length N.
     """
     # Reader
     pdb_dir: str
     reader_options: ReaderOptions = field(default_factory=ReaderOptions)
 
-    # Side chain & encoding options (main-chain only default)
+    # Encoding options (main-chain only default)
     fifth_bit: bool = False
-    side_chain_hot_builder: Optional[Callable[[str], list[bool]]] = None  # input: sequence -> list of bool
+    side_chain_hot_builder: Optional[Callable[[str], list[bool]]] = None  # input: sequence -> list[bool]
 
     # Output directories and templates
     out_dir: str = "results"
-    # Per-group file templates
+    # Per-group intermediate file templates
     decoded_tpl: str = "{protein}_{label}_g{gid}.decoded.jsonl"
     energy_tpl: str = "{protein}_{label}_g{gid}.energy.jsonl"
-    # Optional global append-to files
-    decoded_all_path: Optional[str] = "decoded_all.jsonl"
-    energy_all_path: Optional[str] = "energies_all.jsonl"
 
-    # Energy defaults (reasonable for tetrahedral lattice)
-    energy_config: EnergyConfig = field(default_factory=lambda: EnergyConfig(
-        r_min=0.5,
-        r_contact=1.0,
-        d0=0.57735,
-        lambda_overlap=1000.0,
-        weights={"steric": 1.0, "geom": 0.5, "bond": 0.2, "mj": 1.0},
-        normalize=True,
-        output_path="__unused__.jsonl",  # will be overridden per group
-    ))
+    # Aggregation options
+    aggregate_only: bool = True  # if True, keep only combined files and remove group files
+    combined_names: Tuple[str, str] = ("decoded.jsonl", "energies.jsonl")  # (decoded, energy)
+
+    # Energy defaults (tetrahedral lattice)
+    energy_config: EnergyConfig = field(
+        default_factory=lambda: EnergyConfig(
+            r_min=0.5,
+            r_contact=1.0,
+            d0=0.57735,
+            lambda_overlap=1000.0,
+            weights={"steric": 1.0, "geom": 0.5, "bond": 0.2, "mj": 1.0},
+            normalize=True,
+            output_path="__unused__.jsonl",
+        )
+    )
 
     # Decode defaults (bitstring->turns->coords)
     decoder_output_format: str = "jsonl"  # "jsonl" | "parquet"
-    # Safety toggles
     strict_decode: bool = False
-    strict_energy: bool = False  # currently only affects behavior inside calc if you add strict later
 
 
 class PipelineOrchestrator:
     """
-    Orchestrates the end-to-end flow:
+    Orchestrates:
       - stream groups from SampleReader
       - decode each group's bitstrings to coordinates
       - evaluate energies on decoded coordinates
-      - write per-group artifacts
-      - optionally append into two global files (decoded_all.jsonl, energies_all.jsonl)
-
-    Assumptions:
-      - All CSVs in `pdb_dir` share the same sequence alphabet and consistent schema.
-      - Only main-chain is present; side_chain_hot_vector defaults to all-False of length N.
+      - append all groups to <out_dir>/<pdbid>/decoded.jsonl and energies.jsonl
+      - optionally remove per-group intermediate files
     """
 
     def __init__(self, cfg: OrchestratorConfig):
         self.cfg = cfg
         _ensure_dir(self.cfg.out_dir)
 
-        # Initialize reader
+        # Reader
         self.reader = SampleReader(self.cfg.pdb_dir, self.cfg.reader_options)
 
-        # Global append-to paths (optional)
-        self.decoded_all_path = (
-            os.path.join(self.cfg.out_dir, self.cfg.decoded_all_path)
-            if self.cfg.decoded_all_path
-            else None
-        )
-        self.energy_all_path = (
-            os.path.join(self.cfg.out_dir, self.cfg.energy_all_path)
-            if self.cfg.energy_all_path
-            else None
-        )
-        # Prepare empty/clean files if needed
-        if self.decoded_all_path:
-            # ensure file exists and is empty (overwrite)
-            open(self.decoded_all_path, "w", encoding="utf-8").close()
-        if self.energy_all_path:
-            open(self.energy_all_path, "w", encoding="utf-8").close()
+        # Will be initialized after seeing the first group (we need pdbid)
+        self.decoded_all_path: Optional[str] = None
+        self.energy_all_path: Optional[str] = None
+        self._pdb_root: Optional[str] = None
+
+        # Reusable energy calculator (avoid reloading MJ per group)
+        self.energy_calc = LatticeEnergyCalculator(self.cfg.energy_config)
+
+        # Optional decoder cache keyed by sequence
+        self._decoder_cache: Dict[str, CoordinateBatchDecoder] = {}
 
     # ---------- helpers ----------
 
     def _infer_side_chain_hot(self, sequence: str) -> list[bool]:
-        """Default builder: main-chain only => all False, length=len(sequence)."""
+        """Default: main-chain only => all False, length=len(sequence)."""
         if self.cfg.side_chain_hot_builder is not None:
             return list(self.cfg.side_chain_hot_builder(sequence))
         return [False] * len(sequence)
 
     def _build_decoder(self, sequence: str) -> CoordinateBatchDecoder:
-        """Create a decoder with a side_chain_hot_vector matched to this group's sequence length."""
-        hot_vec = self._infer_side_chain_hot(sequence)
-        dec_cfg = CoordinateDecoderConfig(
-            side_chain_hot_vector=hot_vec,
-            fifth_bit=self.cfg.fifth_bit,
-            output_format=self.cfg.decoder_output_format,
-            output_path="__per_group_set_later__.jsonl",  # will be set per group
-            bitstring_col="bitstring",
-            sequence_col="sequence",
-            strict=self.cfg.strict_decode,
-        )
-        return CoordinateBatchDecoder(dec_cfg)
-
-    def _build_energy_calc(self) -> LatticeEnergyCalculator:
-        """Create an energy calculator with configured MJ path and weights."""
-        return LatticeEnergyCalculator(self.cfg.energy_config)
+        """Get or build a decoder for this sequence length."""
+        if sequence not in self._decoder_cache:
+            hot_vec = self._infer_side_chain_hot(sequence)
+            dec_cfg = CoordinateDecoderConfig(
+                side_chain_hot_vector=hot_vec,
+                fifth_bit=self.cfg.fifth_bit,
+                output_format=self.cfg.decoder_output_format,
+                output_path="__set_per_group__",  # will be set per group
+                bitstring_col="bitstring",
+                sequence_col="sequence",
+                strict=self.cfg.strict_decode,
+            )
+            self._decoder_cache[sequence] = CoordinateBatchDecoder(dec_cfg)
+        return self._decoder_cache[sequence]
 
     def _group_paths(self, protein: str, label: str, gid: int) -> Tuple[str, str]:
-        """Resolve per-group decoded and energy file paths."""
+        """Per-group intermediate files (kept or removed depending on `aggregate_only`)."""
         decoded_name = self.cfg.decoded_tpl.format(protein=protein, label=label, gid=gid)
         energy_name = self.cfg.energy_tpl.format(protein=protein, label=label, gid=gid)
         return os.path.join(self.cfg.out_dir, decoded_name), os.path.join(self.cfg.out_dir, energy_name)
 
-    def _append_file(self, from_path: str, to_path: Optional[str]) -> None:
-        """Append a JSONL file into a global JSONL (line by line)."""
-        if not to_path:
+    def _init_pdb_aggregate_paths(self, pdbid: str) -> None:
+        """Create <out_dir>/<pdbid>/ and prepare combined files."""
+        self._pdb_root = os.path.join(self.cfg.out_dir, pdbid)
+        _ensure_dir(self._pdb_root)
+        decoded_name, energy_name = self.cfg.combined_names
+        self.decoded_all_path = os.path.join(self._pdb_root, decoded_name)
+        self.energy_all_path = os.path.join(self._pdb_root, energy_name)
+        # truncate (start fresh)
+        open(self.decoded_all_path, "w", encoding="utf-8").close()
+        open(self.energy_all_path, "w", encoding="utf-8").close()
+
+    @staticmethod
+    def _append_file(from_path: str, to_path: Optional[str]) -> None:
+        """Append a JSONL file into a combined JSONL (line by line)."""
+        if not to_path or not os.path.exists(from_path):
             return
         with open(from_path, "r", encoding="utf-8") as fin, open(to_path, "a", encoding="utf-8") as fout:
             for line in fin:
@@ -160,11 +159,12 @@ class PipelineOrchestrator:
     def run(self) -> Dict[str, int]:
         """
         Execute the full pipeline over all groups yielded by SampleReader.
-        Returns a small summary with counts of groups processed and records written.
+        Returns summary with counts and combined file paths.
         """
         groups = 0
         decoded_rows_total = 0
         energy_rows_total = 0
+        pdb_initialized = False
 
         for (protein, label, gid), df, meta in self.reader.iter_groups():
             groups += 1
@@ -172,46 +172,60 @@ class PipelineOrchestrator:
                 _LOG.warning("Group (%s, %s, %s) is empty; skipping.", protein, label, gid)
                 continue
 
-            # Ensure sequence column exists for traceability and MJ computation
+            # Initialize combined files under <out_dir>/<pdbid> on first group
+            if not pdb_initialized:
+                self._init_pdb_aggregate_paths(protein)
+                pdb_initialized = True
+
             if "sequence" not in df.columns:
                 _LOG.warning("Group (%s, %s, %s) has no 'sequence' column; skipping.", protein, label, gid)
                 continue
 
-            # Use the first row's sequence to set side_chain_hot_vector
+            # Prepare decoder for this sequence
             seq0 = str(df["sequence"].iloc[0])
-            decoder = self._build_decoder(sequence=seq0)
+            decoder = self._build_decoder(seq0)
+
+            # Per-group intermediate paths
             decoded_path, energy_path = self._group_paths(protein, label, gid)
-
-            # ---- Decode per group ----
-            # Only keep minimum columns required by decoder (bitstring, sequence)
-            in_df = df[[decoder.cfg.bitstring_col, decoder.cfg.sequence_col]].copy()
-            decoder.cfg.output_path = decoded_path  # set per-group output
-            decoder.cfg.output_format = self.cfg.decoder_output_format
-
             _ensure_dir(os.path.dirname(decoded_path))
             _ensure_dir(os.path.dirname(energy_path))
+
+            # ---- Decode ----
+            in_df = df[[decoder.cfg.bitstring_col, decoder.cfg.sequence_col]].copy()
+            decoder.cfg.output_path = decoded_path
+            decoder.cfg.output_format = self.cfg.decoder_output_format
 
             _LOG.info("Decoding group (%s, %s, %s) -> %s", protein, label, gid, decoded_path)
             dec_summary = decoder.decode_and_save(in_df)
             decoded_rows_total += int(dec_summary.get("written", 0))
 
-            # Optionally append decoded into a global file
-            if self.decoded_all_path and os.path.exists(decoded_path):
-                self._append_file(decoded_path, self.decoded_all_path)
+            # Append to combined decoded file
+            self._append_file(decoded_path, self.decoded_all_path)
 
-            # ---- Energy per group ----
-            calc = self._build_energy_calc()
-            calc.cfg.output_path = energy_path  # set per-group output
+            # ---- Energy ----
+            self.energy_calc.cfg.output_path = energy_path
             _LOG.info("Computing energies for group (%s, %s, %s) -> %s", protein, label, gid, energy_path)
-            en_summary = calc.evaluate_jsonl(decoded_path, energy_path)
+            en_summary = self.energy_calc.evaluate_jsonl(decoded_path, energy_path)
             energy_rows_total += int(en_summary.get("written", 0))
 
-            # Optionally append energy into a global file
-            if self.energy_all_path and os.path.exists(energy_path):
-                self._append_file(energy_path, self.energy_all_path)
+            # Append to combined energies file
+            self._append_file(energy_path, self.energy_all_path)
 
-        _LOG.info("Pipeline finished: %d groups, %d decoded rows, %d energy rows.",
-                  groups, decoded_rows_total, energy_rows_total)
+            # Optionally remove intermediate files
+            if self.cfg.aggregate_only:
+                try:
+                    os.remove(decoded_path)
+                except OSError:
+                    pass
+                try:
+                    os.remove(energy_path)
+                except OSError:
+                    pass
+
+        _LOG.info(
+            "Pipeline finished: %d groups, %d decoded rows, %d energy rows. Combined: %s, %s",
+            groups, decoded_rows_total, energy_rows_total, self.decoded_all_path, self.energy_all_path
+        )
         return {
             "groups": groups,
             "decoded_rows": decoded_rows_total,

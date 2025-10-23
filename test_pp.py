@@ -16,7 +16,7 @@ cfg = OrchestratorConfig(
         include_all_csv=False,
     ),
     fifth_bit=False,
-    out_dir="results",
+    out_dir="e_results",
     decoded_all_path="decoded_all.jsonl",
     energy_all_path="energies_all.jsonl",
     decoder_output_format="jsonl",
