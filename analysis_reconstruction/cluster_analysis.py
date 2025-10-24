@@ -150,9 +150,9 @@ def extract_main_vectors(df: pd.DataFrame, col: str) -> Tuple[np.ndarray, List[i
 def hamming_distance_matrix(mat: np.ndarray) -> np.ndarray:
     """Pairwise normalized Hamming distance for integer-coded sequences."""
     n, L = mat.shape
-    dm = np.zeros((n, n), dtype=np.float32)
+    dm = np.zeros((n, n), dtype=np.float16)
     for i in range(n):
-        diff = (mat[i] != mat).astype(np.float32)
+        diff = (mat[i] != mat).astype(np.float16)
         d = diff.mean(axis=1)
         dm[i, :] = d
         dm[:, i] = d
