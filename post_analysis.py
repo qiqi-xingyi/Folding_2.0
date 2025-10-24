@@ -36,7 +36,7 @@ def main():
 
     # === User parameters ===
     input_path = "e_results/1m7y/energies.jsonl"  # path to your energy file
-    refine_mode = "fast"                      # "fast", "standard", or "premium"
+    refine_mode = "standard"                      # "fast", "standard", or "premium"
     subsample_max = 64
     top_energy_pct = 0.30
     geom_thresh = 7.5
