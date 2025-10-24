@@ -4,8 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:analysis.py
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 """
 Top-level entry for QSAD analysis and structure reconstruction.
