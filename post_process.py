@@ -2,7 +2,7 @@
 # @time:10/21/25 14:23
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
-# @File:test_pp.py
+# @File:post_process.py
 
 from qsadpp.orchestrator import OrchestratorConfig, PipelineOrchestrator
 from qsadpp.io_reader import ReaderOptions
