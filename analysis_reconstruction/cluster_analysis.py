@@ -210,6 +210,50 @@ def combine_distance(dm_hamming: np.ndarray, E: np.ndarray, alpha: float = 0.8, 
     dm_E = energy_diff_matrix(E, method=method)
     return alpha * dm_hamming + (1.0 - alpha) * dm_E
 
+def cluster_with_hdbscan(dm: np.ndarray, min_cluster_size: int) -> np.ndarray:
+    """Run HDBSCAN clustering on a precomputed distance matrix."""
+    if not _HDBSCAN_AVAILABLE:
+        raise RuntimeError("hdbscan is not available.")
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, metric="precomputed")
+    labels = clusterer.fit_predict(dm)
+    return labels
+
+
+def silhouette_score_from_distance(dm: np.ndarray, labels: np.ndarray) -> float:
+    """Silhouette from a precomputed distance matrix. Returns -1 if invalid."""
+    n = dm.shape[0]
+    if n != len(labels):
+        return -1.0
+    uniq = [c for c in np.unique(labels) if c != -1]
+    if len(uniq) < 2:
+        return -1.0
+    s_vals = []
+    for i in range(n):
+        li = labels[i]
+        if li == -1:
+            continue
+        same = (labels == li)
+        other = (labels != li) & (labels != -1)
+        same_idx = np.where(same)[0]
+        if len(same_idx) <= 1:
+            continue
+        a = dm[i, same_idx[same_idx != i]].mean() if len(same_idx) > 1 else 0.0
+        b = np.inf
+        for c in uniq:
+            if c == li:
+                continue
+            idx = np.where(labels == c)[0]
+            if len(idx) == 0:
+                continue
+            b = min(b, dm[i, idx].mean())
+        if not np.isfinite(b):
+            continue
+        s = (b - a) / max(a, b) if max(a, b) > 1e-12 else 0.0
+        s_vals.append(s)
+    if not s_vals:
+        return -1.0
+    return float(np.mean(s_vals))
+
 
 def collapse_identical_vectors(mat: np.ndarray, idx: List[int]) -> Tuple[np.ndarray, List[List[int]], np.ndarray]:
     """Collapse identical rows. Return unique-matrix, groups (original df indices), and frequency weights."""
