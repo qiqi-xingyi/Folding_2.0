@@ -63,7 +63,7 @@ def main():
 
     c_cfg = ClusterConfig(
         method="kmedoids",
-        k_candidates=[2, 3, 4, 5, 6, 7, 8],
+        k_candidates=[8, 9, 10],
         energy_key="E_total",
         prefilter_rules=pre_rules,
         random_seed=random_seed,
