@@ -4,14 +4,12 @@
 # @Email : yzhan135@kent.edu
 # @File:structure_refine.py
 
-# -*- coding: utf-8 -*-
-
 import json
 import logging
 import math
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -42,19 +40,22 @@ class RefineConfig:
     id_col: Optional[str] = None
 
     # weighted averaging (sample weights)
-    energy_weights: Dict[str, float] = field(default_factory=lambda: {"E_total": 1.0, "E_geom": 1.0, "E_steric": 1.0})
+    # weights act like exp(-sum alpha_k * E_k); tune alphas below (1.0 is fine)
+    energy_weights: Dict[str, float] = field(default_factory=lambda: {
+        "E_total": 1.0, "E_geom": 1.0, "E_steric": 1.0
+    })
     weight_eps: float = 1e-9
 
-    # continuous mean & projection
-    gpa_iters: int = 3         # iterations of align-then-mean for continuous averaging (premium can increase)
+    # continuous mean & projection (geometry)
+    gpa_iters: int = 1                # we still allow 1 round of re-align to a proto-mean
     proj_enforce_bond: bool = True
-    target_ca_distance: Optional[float] = 3.8  # Å; None -> infer from medoid mean
-    proj_smooth_strength: float = 0.10   # Laplacian smoothing strength per iter
+    target_ca_distance: Optional[float] = 3.8  # Å
+    proj_smooth_strength: float = 0.03         # weaker smoothing to avoid collapse
     proj_iters: int = 10
-    min_separation: float = 2.5          # simple self-collision avoidance (Cα-only)
+    min_separation: float = 2.8                # Cα-only non-neighbor collision threshold
 
-    # local polishing
-    do_local_polish: bool = True
+    # local polishing (optional if energy_fn provided)
+    do_local_polish: bool = False
     local_polish_steps: int = 20
     stay_lambda: float = 0.05
     step_size: float = 0.05              # Å for finite-diff gradients if energy_fn provided
@@ -136,12 +137,14 @@ def pairwise_rmsd_sum(X_list: List[np.ndarray]) -> np.ndarray:
 
 
 def sample_weights(row: pd.Series, wcfg: Dict[str, float], eps: float = 1e-9) -> float:
-    """Compute exp(-alpha E_total) * exp(-beta E_geom) * exp(-gamma E_steric)."""
+    """Compute exp(-alpha_k * E_k ...). Larger energy -> smaller weight."""
     val = 0.0
     for k, alpha in wcfg.items():
         if k in row and pd.notna(row[k]):
             val += alpha * float(row[k])
-    w = math.exp(-max(val, -50.0))  # clamp
+    # soft clamp to prevent exp overflow
+    val = min(max(val, -50.0), 50.0)
+    w = math.exp(-val)
     return max(w, eps)
 
 
@@ -190,8 +193,10 @@ def enforce_neighbor_distance(coords: np.ndarray, target: float, iters: int = 1)
             b = X[i + 1]
             v = b - a
             d = np.linalg.norm(v)
-            if d < 1e-8:
-                continue
+            if d < 1e-12:
+                # tiny random nudge to avoid zero-length edges
+                v = np.array([1e-6, 0.0, 0.0], dtype=float)
+                d = 1e-6
             delta = (target - d) * 0.5
             dir_ = v / d
             X[i] -= delta * dir_
@@ -199,15 +204,15 @@ def enforce_neighbor_distance(coords: np.ndarray, target: float, iters: int = 1)
     return X
 
 
-def repel_min_separation(coords: np.ndarray, min_sep: float, factor: float = 0.1) -> np.ndarray:
-    """Push points apart if closer than min_sep (very simple repulsion)."""
+def repel_min_separation(coords: np.ndarray, min_sep: float, factor: float = 0.15) -> np.ndarray:
+    """Push points apart if closer than min_sep (skip immediate neighbors)."""
     X = coords.copy()
     L = X.shape[0]
     for i in range(L):
-        for j in range(i + 2, L):  # skip immediate neighbors
+        for j in range(i + 2, L):
             v = X[j] - X[i]
             d = np.linalg.norm(v)
-            if d < 1e-8:
+            if d < 1e-12:
                 continue
             if d < min_sep:
                 dir_ = v / d
@@ -215,6 +220,46 @@ def repel_min_separation(coords: np.ndarray, min_sep: float, factor: float = 0.1
                 X[i] -= push * dir_
                 X[j] += push * dir_
     return X
+
+
+def unit_directions_from_coords(X: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Compute unit edge directions from coordinate polyline."""
+    V = X[1:] - X[:-1]
+    N = np.linalg.norm(V, axis=1, keepdims=True)
+    N = np.maximum(N, eps)
+    D = V / N
+    return D  # (L-1, 3)
+
+
+def reconstruct_by_dirs(P0: np.ndarray, D: np.ndarray, step: float) -> np.ndarray:
+    """Reconstruct coordinates by accumulating unit directions with fixed step."""
+    Lm1 = D.shape[0]
+    P = np.zeros((Lm1 + 1, 3), dtype=float)
+    P[0] = P0
+    for i in range(Lm1):
+        P[i + 1] = P[i] + step * D[i]
+    return P
+
+
+def qc_geometry(coords: np.ndarray, min_sep_nonadj: float = 2.8) -> Dict[str, float]:
+    """Simple geometry QC metrics."""
+    dif = coords[1:] - coords[:-1]
+    dists = np.linalg.norm(dif, axis=1)
+    # min distance among non-neighbor pairs
+    L = coords.shape[0]
+    min_nonadj = np.inf
+    for i in range(L):
+        for j in range(i + 2, L):
+            d = np.linalg.norm(coords[j] - coords[i])
+            if d < min_nonadj:
+                min_nonadj = d
+    return {
+        "bond_mean": float(dists.mean()) if len(dists) else float("nan"),
+        "bond_std": float(dists.std()) if len(dists) else float("nan"),
+        "bond_min": float(dists.min()) if len(dists) else float("nan"),
+        "bond_max": float(dists.max()) if len(dists) else float("nan"),
+        "min_nonadjacent": float(min_nonadj) if np.isfinite(min_nonadj) else float("nan"),
+    }
 
 
 # -------------------------------
@@ -272,14 +317,13 @@ class StructureRefiner:
             self.report = self._build_report()
             return
 
-        # standard/premium: build continuous mean and project
+        # standard/premium: build continuous mean (by averaged directions) and project
         self.medoid_ca = self.aligned_list[self.medoid_idx_in_sub].copy()
-        self._continuous_mean()
+        self._continuous_mean()      # now does direction-averaging + 3.8Å reconstruction
         self._project_geometry()
 
         if self.cfg.refine_mode == "premium":
-            # premium can slightly increase iterations for a tighter mean
-            self._continuous_mean(extra_iters=max(0, self.cfg.gpa_iters - 3))
+            # minor extra pass
             self._project_geometry()
 
         # optional local polishing with energy function
@@ -366,6 +410,14 @@ class StructureRefiner:
             aligned.append(aligned_X)
         self.aligned_list = aligned
 
+        # one optional GPA iteration to stabilize orientation around a proto-mean
+        if self.cfg.gpa_iters > 0:
+            mean0 = np.mean(np.stack(self.aligned_list, axis=0), axis=0)
+            new_list = []
+            for X in self.aligned_list:
+                new_list.append(align_to_reference(mean0, X))
+            self.aligned_list = new_list
+
     def _select_medoid(self):
         aligned = self.aligned_list
         sums = pairwise_rmsd_sum(aligned)
@@ -373,11 +425,15 @@ class StructureRefiner:
         self.medoid_idx_in_sub = idx
 
     def _continuous_mean(self, extra_iters: int = 0):
+        """
+        Build a continuous mean by averaging unit directions and reconstructing
+        with a fixed Cα step (default 3.8 Å) from the anchor start point.
+        """
         cfg = self.cfg
         assert self.aligned_list is not None
         L = self.aligned_list[0].shape[0]
 
-        # initial mean as weighted average in current frame
+        # sample weights by energy (softmax-like via exp(-sum alpha E))
         W = []
         for _, row in self.sub_df.iterrows():
             w = sample_weights(row, cfg.energy_weights, cfg.weight_eps)
@@ -385,48 +441,52 @@ class StructureRefiner:
         W = np.asarray(W, dtype=float)
         W /= W.sum() + 1e-12
 
-        mean = np.zeros((L, 3), dtype=float)
-        for w, X in zip(W, self.aligned_list):
-            mean += w * X
+        # compute unit edge directions for each aligned sample
+        dirs_list = []
+        for X in self.aligned_list:
+            D = unit_directions_from_coords(X)  # (L-1,3)
+            dirs_list.append(D)
+        D_all = np.stack(dirs_list, axis=0)     # (M, L-1, 3)
 
-        iters = max(0, cfg.gpa_iters) + max(0, extra_iters)
-        # small number of re-alignments to the evolving mean
-        for _ in range(iters):
-            new_list = []
-            for X in self.aligned_list:
-                new_list.append(align_to_reference(mean, X))
-            self.aligned_list = new_list
-            mean = np.zeros((L, 3), dtype=float)
-            for w, X in zip(W, self.aligned_list):
-                mean += w * X
+        # energy-weighted mean direction and re-normalize per edge
+        Dbar = (W[:, None, None] * D_all).sum(axis=0)  # (L-1,3)
+        norms = np.linalg.norm(Dbar, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        Dbar = Dbar / norms
 
+        step = float(cfg.target_ca_distance or 3.8)
+        # use medoid's first CA as the start to minimize global drift
+        if self.medoid_idx_in_sub is not None:
+            P0 = self.aligned_list[self.medoid_idx_in_sub][0]
+        else:
+            P0 = np.zeros(3, dtype=float)
+
+        mean = reconstruct_by_dirs(P0, Dbar, step)  # (L,3)
         self.mean_ca = mean
 
     def _project_geometry(self):
+        """
+        Projection: strong neighbor enforcement -> light smoothing -> repulsion,
+        repeated for cfg.proj_iters; finally do an arc-length reconstruction to
+        lock all Cα-Cα distances to the target step.
+        """
         cfg = self.cfg
         assert self.mean_ca is not None
         X = self.mean_ca.copy()
 
         # set target Cα distance
-        if cfg.target_ca_distance is not None:
-            d0 = float(cfg.target_ca_distance)
-        else:
-            # infer from medoid
-            if self.medoid_ca is not None:
-                dif = self.medoid_ca[1:] - self.medoid_ca[:-1]
-                d0 = float(np.mean(np.linalg.norm(dif, axis=1)))
-            else:
-                dif = X[1:] - X[:-1]
-                d0 = float(np.mean(np.linalg.norm(dif, axis=1)))
+        d0 = float(cfg.target_ca_distance or 3.8)
 
-        # projection loop
         for _ in range(cfg.proj_iters):
             if cfg.proj_enforce_bond:
-                X = enforce_neighbor_distance(X, d0, iters=1)
-            X = laplacian_smooth(X, cfg.proj_smooth_strength)
+                X = enforce_neighbor_distance(X, d0, iters=10)        # strong
+            X = laplacian_smooth(X, cfg.proj_smooth_strength)         # light
             X = repel_min_separation(X, cfg.min_separation, factor=0.15)
 
-        self.projected_ca = X
+        # exit insurance: arc-length reconstruction at exact d0
+        D = unit_directions_from_coords(X)
+        X_fixed = reconstruct_by_dirs(X[0], D, d0)
+        self.projected_ca = X_fixed
 
     def _local_energy_polish(self):
         cfg = self.cfg
@@ -447,7 +507,6 @@ class StructureRefiner:
 
         base_e = energy_total(Z)
         if not np.isfinite(base_e):
-            # skip polishing if energy function fails
             self.refined_ca = self.projected_ca.copy()
             return
 
@@ -468,20 +527,21 @@ class StructureRefiner:
             grad += 2.0 * cfg.stay_lambda * (Z - Q)
 
             # take a small step
-            Z_new = Z - 0.1 * grad  # simple step size
-            # quick projection-lite to avoid drifting apart
-            Z_new = enforce_neighbor_distance(Z_new, self.cfg.target_ca_distance or 3.8, iters=1)
-            Z_new = repel_min_separation(Z_new, self.cfg.min_separation, factor=0.1)
+            Z_new = Z - 0.1 * grad
+            # projection-lite to keep geometry sane
+            Z_new = enforce_neighbor_distance(Z_new, d0=cfg.target_ca_distance or 3.8, iters=2)
+            Z_new = repel_min_separation(Z_new, self.cfg.min_separation, factor=0.10)
 
             e_new = energy_total(Z_new)
             if np.isfinite(e_new) and e_new <= base_e:
                 Z = Z_new
                 base_e = e_new
             else:
-                # early stop if no improvement
                 break
 
-        self.refined_ca = Z
+        # final lock by arc-length reconstruction
+        D = unit_directions_from_coords(Z)
+        self.refined_ca = reconstruct_by_dirs(Z[0], D, float(cfg.target_ca_distance or 3.8))
 
     # ---- outputs ----
 
@@ -503,6 +563,17 @@ class StructureRefiner:
         rep["n_cluster"] = 0 if self.cluster_df is None else int(len(self.cluster_df))
         rep["n_used_for_refine"] = 0 if self.sub_df is None else int(len(self.sub_df))
         rep["mode"] = self.cfg.refine_mode
+
+        # geometry QC
+        if self.refined_ca is not None:
+            qc = qc_geometry(self.refined_ca, min_sep_nonadj=self.cfg.min_separation)
+            rep.update({
+                "bond_mean": qc["bond_mean"],
+                "bond_std": qc["bond_std"],
+                "bond_min": qc["bond_min"],
+                "bond_max": qc["bond_max"],
+                "min_nonadjacent": qc["min_nonadjacent"],
+            })
         return rep
 
     def save_outputs(self):
