@@ -102,7 +102,7 @@ def main():
         proj_smooth_strength=0.10,
         proj_iters=10,
         do_local_polish=do_local_polish,
-        output_dir=input_dir,      # write refined structure here
+        output_dir=input_dir,
         random_seed=random_seed,
     )
 

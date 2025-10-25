@@ -52,7 +52,7 @@ class RefineConfig:
     target_ca_distance: Optional[float] = 3.8  # Å
     proj_smooth_strength: float = 0.03         # weaker smoothing to avoid collapse
     proj_iters: int = 10
-    min_separation: float = 2.8                # Cα-only non-neighbor collision threshold
+    min_separation: float = 3.0                # Cα-only non-neighbor collision threshold
 
     # local polishing (optional if energy_fn provided)
     do_local_polish: bool = False
@@ -486,6 +486,28 @@ class StructureRefiner:
         # exit insurance: arc-length reconstruction at exact d0
         D = unit_directions_from_coords(X)
         X_fixed = reconstruct_by_dirs(X[0], D, d0)
+        self.projected_ca = X_fixed
+
+        D = unit_directions_from_coords(X)
+        X_fixed = reconstruct_by_dirs(X[0], D, d0)
+
+        # --- NEW: post-pass to resolve residual close contacts ---
+        for _ in range(5):  # a few safety passes
+            # quick QC
+            min_nonadj = np.inf
+            L = X_fixed.shape[0]
+            for i in range(L):
+                for j in range(i + 2, L):
+                    dij = np.linalg.norm(X_fixed[j] - X_fixed[i])
+                    if dij < min_nonadj:
+                        min_nonadj = dij
+            if min_nonadj >= self.cfg.min_separation:
+                break
+            # repel & re-lock
+            X_fixed = repel_min_separation(X_fixed, self.cfg.min_separation, factor=0.25)
+            D = unit_directions_from_coords(X_fixed)
+            X_fixed = reconstruct_by_dirs(X_fixed[0], D, d0)
+
         self.projected_ca = X_fixed
 
     def _local_energy_polish(self):
