@@ -21,9 +21,9 @@ _MJ_MATRIX_PATH = os.path.join(os.path.dirname(__file__), "mj_matrix.txt")
 
 @dataclass
 class EnergyConfig:
-    r_min: float = 0.5
-    r_contact: float = 1.0
-    d0: float = 0.57735
+    r_min: float = 1.0
+    r_contact: float = 1.4
+    d0: float = 1.0
     lambda_overlap: float = 1000.0
     weights: Dict[str, float] = field(
         default_factory=lambda: {"steric": 1.0, "geom": 0.5, "bond": 0.2, "mj": 1.0}
