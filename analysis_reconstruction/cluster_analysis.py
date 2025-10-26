@@ -28,8 +28,8 @@ except Exception:
 @dataclass
 class ClusterConfig:
     # base clustering options
-    method: str = "kmedoids"                # "hdbscan" | "kmedoids"
-    min_cluster_size: Optional[int] = None  # for hdbscan
+    method: str = "hdbscan"                # "hdbscan" | "kmedoids"
+    min_cluster_size: Optional[int] = 2000  # for hdbscan
     k_candidates: Sequence[int] = field(default_factory=lambda: tuple(range(2, 9)))
 
     # columns and IO
@@ -57,7 +57,7 @@ class ClusterConfig:
 
     # optional: blend energy into distances (usually unnecessary with the kernel)
     use_energy_in_distance: bool = False
-    energy_alpha: float = 0.6
+    energy_alpha: float = 0.5
     energy_distance_method: str = "rank"    # "rank" | "mad"
 
     # weighted k-medoids (still available; we cluster in embedding space)
