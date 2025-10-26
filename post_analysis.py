@@ -79,7 +79,7 @@ def main():
 
     best_idx = analyzer.get_best_cluster_indices()
     if not best_idx:
-        logging.error("No best cluster selected. Check thresholds or data integrity.")
+        logging.error("No best cluster Pdbbind. Check thresholds or data integrity.")
         return
 
     # Extract the best cluster data

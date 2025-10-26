@@ -11,7 +11,7 @@ IDE-click version: compute Ca-aligned RMSD between prediction and ground-truth s
 Defaults:
   PRED_PDB : e_results/1m7y/refined_ca.pdb
   INDEX_TSV: dataset/benchmark_info.txt
-  DATA_ROOT: dataset/selected/
+  DATA_ROOT: dataset/Pdbbind/
 
 Outputs:
   - Prints RMSD
@@ -28,7 +28,7 @@ import numpy as np
 # ====== DEFAULT PATHS (edit here if needed) ======
 PRED_PDB  = os.path.join("e_results", "1m7y", "refined_ca.pdb")
 INDEX_TSV = os.path.join("dataset", "benchmark_info.txt")
-DATA_ROOT = os.path.join("dataset", "selected")
+DATA_ROOT = os.path.join("dataset", "Pdbbind")
 
 
 # ---------- math ----------

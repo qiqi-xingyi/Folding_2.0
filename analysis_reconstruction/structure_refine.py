@@ -304,7 +304,7 @@ class StructureRefiner:
 
         self._subsample_cluster()
         if len(self.sub_df) == 0:
-            raise RuntimeError("No rows selected for refinement.")
+            raise RuntimeError("No rows Pdbbind for refinement.")
 
         self._select_anchor()
         self._align_to_anchor()
