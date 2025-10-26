@@ -36,7 +36,7 @@ def main():
     refine_mode = "standard"                      # "fast", "standard", or "premium"
     subsample_max = 64
     top_energy_pct = 0.30
-    geom_thresh = 7.5
+    geom_thresh = 8.5
     steric_ok = True
     target_ca_distance = 3.8
     random_seed = 42
