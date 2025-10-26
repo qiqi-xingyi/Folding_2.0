@@ -73,6 +73,13 @@ class ClusterConfig:
     # optional: only low-energy portion enters clustering
     energy_quantile_for_clustering: Optional[float] = None
 
+    # ---- NEW: robust batch rescaling of energy before kernel/weights ----
+    energy_rescale_mode: str = "quantile"   # "none" | "quantile"
+    energy_rescale_low_q: float = 0.01
+    energy_rescale_high_q: float = 0.99
+    energy_rescale_target: float = 10.0     # map [q_low, q_high] -> [0, target]
+    energy_scaled_key: str = "E_total_scaled"
+
     def normalize(self):
         self.method = str(self.method).lower().strip()
         if self.min_cluster_size is None:
@@ -83,6 +90,8 @@ class ClusterConfig:
             self.energy_distance_method = "rank"
         if self.distance_model not in ("geom_diffusion", "hamming"):
             self.distance_model = "geom_diffusion"
+        if self.energy_rescale_mode not in ("none", "quantile"):
+            self.energy_rescale_mode = "quantile"
 
 
 # -------------------------------
@@ -655,6 +664,7 @@ class ClusterAnalyzer:
         self.best_cluster_id_: Optional[int] = None
         self.best_member_indices_: Optional[List[int]] = None
         self.embedding_: Optional[np.ndarray] = None
+        self._energy_scale_info: Optional[Dict[str, Any]] = None
         self.rng = np.random.RandomState(self.cfg.random_seed)
 
     # ---- data I/O ----
@@ -695,7 +705,6 @@ class ClusterAnalyzer:
         if self.cfg.positions_col not in self.df_.columns:
             raise ValueError(f"Column {self.cfg.positions_col} not found.")
         pos_all, valid_idx2 = extract_positions(self.df_, self.cfg.positions_col)
-        # map idx to rows in positions tensor
         mapper = {orig_i: k for k, orig_i in enumerate(valid_idx2)}
         rows = [mapper[i] for i in idx if i in mapper]
         if len(rows) != len(idx):
@@ -706,6 +715,47 @@ class ClusterAnalyzer:
     def _distance_matrix_hamming(self):
         assert self.vec_mat is not None
         self.dm_ = hamming_distance_matrix(self.vec_mat)
+
+    # ---- NEW: robust batch energy rescaling ----
+    def _rescale_energy_batch(self):
+        assert self.df_ is not None
+        ek = self.cfg.energy_key
+        if ek not in self.df_.columns:
+            raise ValueError(f"Energy key {ek} not found in data.")
+        e = self.df_[ek].astype(float)
+
+        if self.cfg.energy_rescale_mode.lower() != "quantile":
+            self.df_[self.cfg.energy_scaled_key] = e.values
+            self._energy_scale_info = {"mode": "none", "used_key": self.cfg.energy_scaled_key}
+            return
+
+        ql = float(np.quantile(e, self.cfg.energy_rescale_low_q))
+        qh = float(np.quantile(e, self.cfg.energy_rescale_high_q))
+        if not np.isfinite(ql) or not np.isfinite(qh) or qh <= ql + 1e-12:
+            # degenerate; fall back to identity
+            self.df_[self.cfg.energy_scaled_key] = e.values
+            self._energy_scale_info = {
+                "mode": "degenerate",
+                "low_q": self.cfg.energy_rescale_low_q,
+                "high_q": self.cfg.energy_rescale_high_q,
+                "low": float(ql),
+                "high": float(qh),
+                "target": float(self.cfg.energy_rescale_target),
+                "used_key": self.cfg.energy_scaled_key,
+            }
+            return
+        t = float(self.cfg.energy_rescale_target)
+        es = np.clip((e - ql) / (qh - ql), 0.0, 1.0) * t
+        self.df_[self.cfg.energy_scaled_key] = es.values
+        self._energy_scale_info = {
+            "mode": "quantile",
+            "low_q": self.cfg.energy_rescale_low_q,
+            "high_q": self.cfg.energy_rescale_high_q,
+            "low": float(ql),
+            "high": float(qh),
+            "target": t,
+            "used_key": self.cfg.energy_scaled_key,
+        }
 
     def fit(self):
         if self.df_raw is None:
@@ -727,20 +777,24 @@ class ClusterAnalyzer:
             self.vec_mat = self.vec_mat[keep_mask]
             self.valid_idx = list(idx_valid[keep_mask])
 
+        # NEW: batch rescale energy to a fixed range for kernel/weights
+        self._rescale_energy_batch()
+        ekey_used = self.cfg.energy_scaled_key  # this column is used for kernel/weights
+
         # unique-level consolidation by main_vectors
         if self.cfg.collapse_identical:
             mat_u, groups, freq_w = collapse_identical_vectors(self.vec_mat, self.valid_idx)
 
-            ek = self.cfg.energy_key
-            if ek not in self.df_.columns:
-                raise ValueError(f"Energy key {ek} not found in data.")
-            colE = self.df_[ek].astype(float)
-            E_u = np.array([float(np.median(colE.iloc[grp].values)) for grp in groups], dtype=np.float64)
+            # median energy per unique group (scaled)
+            if ekey_used not in self.df_.columns:
+                raise ValueError(f"Energy key {ekey_used} not found in data.")
+            colE_scaled = self.df_[ekey_used].astype(float)
+            E_u = np.array([float(np.median(colE_scaled.iloc[grp].values)) for grp in groups], dtype=np.float64)
 
-            # pick representative positions per unique vector: choose median-energy member
+            # pick representative positions per unique vector: choose median-energy member (based on scaled energy)
             rep_indices = []
             for grp in groups:
-                es = colE.iloc[grp].values.astype(float)
+                es = colE_scaled.iloc[grp].values.astype(float)
                 mid_rank = np.argsort(es)[len(es)//2]
                 rep_indices.append(grp[mid_rank])
 
@@ -818,7 +872,7 @@ class ClusterAnalyzer:
                 if len(rows) != len(self.valid_idx):
                     raise RuntimeError("Positions index mismatch on sample-level path.")
                 POS = pos_all[rows]
-                E = self.df_.iloc[self.valid_idx][self.cfg.energy_key].astype(float).values
+                E = self.df_.iloc[self.valid_idx][ekey_used].astype(float).values
 
                 dm_geom = rmsd_distance_matrix(POS)
                 K = build_energy_geometry_kernel(dm_geom, E,
@@ -837,7 +891,7 @@ class ClusterAnalyzer:
             else:
                 self._distance_matrix_hamming()
                 dm = self.dm_
-                E = self.df_.iloc[self.valid_idx][self.cfg.energy_key].astype(float).values
+                E = self.df_.iloc[self.valid_idx][ekey_used].astype(float).values
                 if self.cfg.use_energy_in_distance:
                     dm = combine_distance(dm, E, alpha=self.cfg.energy_alpha, method=self.cfg.energy_distance_method)
 
@@ -872,9 +926,10 @@ class ClusterAnalyzer:
         # energy stats and best cluster selection
         assert self.labels_ is not None
         working_df = self.df_.iloc[self.valid_idx].copy()
-        if self.cfg.energy_key not in working_df.columns:
-            raise ValueError(f"Energy key {self.cfg.energy_key} not found in data.")
-        stats = compute_cluster_energy_stats(working_df, self.labels_, self.cfg.energy_key)
+        if ekey_used not in working_df.columns:
+            raise ValueError(f"Energy key {ekey_used} not found in data.")
+        # use scaled energy for stats and best cluster choice
+        stats = compute_cluster_energy_stats(working_df, self.labels_, ekey_used)
         self.stats_ = stats
         best_cid = choose_best_cluster(stats)
         self.best_cluster_id_ = best_cid
@@ -919,6 +974,8 @@ class ClusterAnalyzer:
             "min_cluster_size": self.cfg.min_cluster_size,
             "k_candidates": list(self.cfg.k_candidates),
             "energy_key": self.cfg.energy_key,
+            "energy_key_used": self.cfg.energy_scaled_key,
+            "energy_rescale": self._energy_scale_info or {"mode": "unknown"},
             "distance_model": self.cfg.distance_model,
             "geom_kernel_eps": self.cfg.geom_kernel_eps,
             "knn": self.cfg.knn,
