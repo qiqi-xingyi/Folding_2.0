@@ -46,18 +46,18 @@ class ClusterConfig:
     # ---- EGDC: energy-geometry diffusion clustering ----
     distance_model: str = "geom_diffusion"  # "geom_diffusion" | "hamming" (fallback)
     # geometric kernel (RMSD -> Gaussian kernel), with kNN sparsification
-    geom_kernel_eps: float = 1.0            # scale for RMSD Gaussian kernel
-    knn: int = 15                           # keep top-k neighbors per row (symmetrized)
+    geom_kernel_eps: float = 0.5            # scale for RMSD Gaussian kernel
+    knn: int = 40                           # keep top-k neighbors per row (symmetrized)
     # energy weighting to form a reversible kernel (detailed balance)
     temperature_kT: float = 0.5             # effective temperature
 
     # diffusion map embedding
-    diffusion_time: int = 2                 # diffusion time t
+    diffusion_time: int = 3                 # diffusion time t
     embedding_dim: int = 10                 # number of non-trivial eigenvectors
 
     # optional: blend energy into distances (usually unnecessary with the kernel)
     use_energy_in_distance: bool = False
-    energy_alpha: float = 0.8
+    energy_alpha: float = 0.6
     energy_distance_method: str = "rank"    # "rank" | "mad"
 
     # weighted k-medoids (still available; we cluster in embedding space)
