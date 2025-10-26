@@ -1,5 +1,5 @@
 # --*-- conding:utf-8 --*--
-# @time:10/23/25 18:09
+# @time:10/23/26 1:30
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
 # @File:cluster_analysis.py
@@ -40,25 +40,37 @@ class ClusterConfig:
     id_col: Optional[str] = None            # if None, DataFrame index will be used on save
     sequence_col: str = "sequence"
     main_vectors_col: str = "main_vectors"
+    positions_col: str = "main_positions"   # backbone coordinates for geometry
     strict_same_length: bool = True
 
-    # ---- energy-guided clustering (C) ----
-    # C1: use energy in distance
-    use_energy_in_distance: bool = True
-    energy_alpha: float = 0.4               # d = alpha*Hamming + (1-alpha)*EnergyDiff
+    # ---- EGDC: energy-geometry diffusion clustering ----
+    distance_model: str = "geom_diffusion"  # "geom_diffusion" | "hamming" (fallback)
+    # geometric kernel (RMSD -> Gaussian kernel), with kNN sparsification
+    geom_kernel_eps: float = 1.0            # scale for RMSD Gaussian kernel
+    knn: int = 15                           # keep top-k neighbors per row (symmetrized)
+    # energy weighting to form a reversible kernel (detailed balance)
+    temperature_kT: float = 0.5             # effective temperature
+
+    # diffusion map embedding
+    diffusion_time: int = 2                 # diffusion time t
+    embedding_dim: int = 10                 # number of non-trivial eigenvectors
+
+    # optional: blend energy into distances (usually unnecessary with the kernel)
+    use_energy_in_distance: bool = False
+    energy_alpha: float = 0.8
     energy_distance_method: str = "rank"    # "rank" | "mad"
 
-    # C2: weighted PAM (energy->weights)
+    # weighted k-medoids (still available; we cluster in embedding space)
     use_weighted_pam: bool = True
     energy_weight_beta: float = 2.0         # larger -> stronger emphasis on low energy
 
-    # stabilizers against giant clusters
+    # stabilizers
     collapse_identical: bool = True
     silhouette_floor: float = 0.02
     max_cluster_frac: float = 0.60
     penalty_lambda: float = 0.5
 
-    # optional: only low-energy portion enters clustering (keep None to disable)
+    # optional: only low-energy portion enters clustering
     energy_quantile_for_clustering: Optional[float] = None
 
     def normalize(self):
@@ -69,6 +81,8 @@ class ClusterConfig:
             self.max_cluster_frac = 0.60
         if self.energy_distance_method not in ("rank", "mad"):
             self.energy_distance_method = "rank"
+        if self.distance_model not in ("geom_diffusion", "hamming"):
+            self.distance_model = "geom_diffusion"
 
 
 # -------------------------------
@@ -173,6 +187,40 @@ def extract_main_vectors(df: pd.DataFrame, col: str) -> Tuple[np.ndarray, List[i
     return mat, valid_idx
 
 
+def extract_positions(df: pd.DataFrame, col: str) -> Tuple[np.ndarray, List[int]]:
+    """Return (tensor[N,L,3], valid_indices). Values must be iterable (Lx3) or JSON."""
+    valid_idx: List[int] = []
+    pos_list: List[np.ndarray] = []
+    for i, v in enumerate(df[col].tolist()):
+        if v is None:
+            continue
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                logging.warning("Row %d has string positions but not JSON-decodable; skip.", i)
+                continue
+        if not isinstance(v, (list, tuple)):
+            continue
+        try:
+            arr = np.array(v, dtype=float)  # shape (L, 3) or (L+1, 3)
+            if arr.ndim != 2 or arr.shape[1] != 3:
+                continue
+        except Exception:
+            continue
+        pos_list.append(arr)
+        valid_idx.append(i)
+    if not pos_list:
+        raise ValueError("No valid positions found.")
+    lengths = {p.shape[0] for p in pos_list}
+    if len(lengths) != 1:
+        logging.warning("positions have varying lengths: %s", sorted(lengths))
+        L = min(lengths)
+        pos_list = [p[:L] for p in pos_list]
+    pos = np.stack(pos_list, axis=0)  # (N, L, 3)
+    return pos, valid_idx
+
+
 def hamming_distance_matrix(mat: np.ndarray) -> np.ndarray:
     """Pairwise normalized Hamming distance for integer-coded sequences."""
     n, L = mat.shape
@@ -186,29 +234,130 @@ def hamming_distance_matrix(mat: np.ndarray) -> np.ndarray:
 
 
 # -------------------------------
-# Energy-guided helpers (C)
+# Geometry & EGDC helpers
 # -------------------------------
 
+def _kabsch_rmsd(A: np.ndarray, B: np.ndarray) -> float:
+    """RMSD between two point sets after optimal superposition (Kabsch).
+    A, B: (L,3)
+    """
+    Ac = A - A.mean(axis=0, keepdims=True)
+    Bc = B - B.mean(axis=0, keepdims=True)
+    H = Ac.T @ Bc
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    Br = Bc @ R
+    diff = Ac - Br
+    return float(np.sqrt((diff * diff).sum() / A.shape[0]))
+
+
+def rmsd_distance_matrix(pos: np.ndarray) -> np.ndarray:
+    """Pairwise RMSD (Kabsch) for (N,L,3)."""
+    N = pos.shape[0]
+    dm = np.zeros((N, N), dtype=np.float32)
+    for i in range(N):
+        Ai = pos[i]
+        for j in range(i + 1, N):
+            d = _kabsch_rmsd(Ai, pos[j])
+            dm[i, j] = dm[j, i] = d
+    return dm
+
+
 def energy_diff_matrix(E: np.ndarray, method: str = "rank") -> np.ndarray:
-    """Return energy difference 'distance' in [0,1]."""
+    """Energy difference 'distance' in [0,1]."""
     N = len(E)
     if N <= 1:
         return np.zeros((N, N), dtype=np.float32)
     if method == "rank":
-        ranks = E.argsort().argsort().astype(np.float64)  # 0..N-1
+        ranks = E.argsort().argsort().astype(np.float64)
         R = np.abs(ranks[:, None] - ranks[None, :]) / max(1, N - 1)
         return R.astype(np.float32)
     else:
         med = np.median(E)
         mad = np.median(np.abs(E - med)) + 1e-9
-        D = np.abs(E[:, None] - E[None, :]) / (mad * 6.0)  # ~IQR scale
+        D = np.abs(E[:, None] - E[None, :]) / (mad * 6.0)
         return np.clip(D, 0.0, 1.0).astype(np.float32)
 
 
-def combine_distance(dm_hamming: np.ndarray, E: np.ndarray, alpha: float = 0.8, method: str = "rank") -> np.ndarray:
-    """d = alpha * Hamming + (1 - alpha) * EnergyDiff."""
+def combine_distance(dm_base: np.ndarray, E: np.ndarray, alpha: float = 0.8, method: str = "rank") -> np.ndarray:
+    """d = alpha * base + (1 - alpha) * EnergyDiff."""
     dm_E = energy_diff_matrix(E, method=method)
-    return alpha * dm_hamming + (1.0 - alpha) * dm_E
+    return alpha * dm_base + (1.0 - alpha) * dm_E
+
+
+def _symmetrize_max(mat: np.ndarray):
+    return np.maximum(mat, mat.T)
+
+
+def build_energy_geometry_kernel(dm_geom: np.ndarray,
+                                 E: np.ndarray,
+                                 eps: float,
+                                 kT: float,
+                                 knn: int) -> np.ndarray:
+    """
+    Reversible kernel K (satisfies detailed balance):
+      base_ij = exp(-(d_ij^2) / eps^2) from geometry (RMSD);
+      K_ij = base_ij * sqrt(pi_j / pi_i), where pi_i ∝ exp(-E_i/kT).
+    The kernel is sparsified by symmetric kNN.
+    """
+    N = dm_geom.shape[0]
+    base = np.exp(- (dm_geom ** 2) / max(1e-12, eps ** 2))
+    np.fill_diagonal(base, 0.0)
+
+    if knn is not None and knn > 0 and knn < N - 1:
+        mask = np.zeros_like(base, dtype=bool)
+        idx_sorted = np.argsort(-base, axis=1)
+        for i in range(N):
+            nn = idx_sorted[i, :knn]
+            mask[i, nn] = True
+        base = base * (mask | mask.T)
+
+    pi = np.exp(- (E - float(np.min(E))) / max(1e-12, kT))
+    pi = pi / (pi.sum() + 1e-12)
+    sqrt_ratio = np.sqrt(np.clip(pi[None, :] / (pi[:, None] + 1e-300), 0.0, 1e300))
+    K = base * sqrt_ratio
+    K[K < 1e-15] = 0.0
+    return K
+
+
+def diffusion_map_embedding_from_kernel(K: np.ndarray, t: int, m: int) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Symmetric normalization: S = D^{-1/2} K D^{-1/2}.
+    Eigendecompose S; take top m non-trivial eigenvectors (skip the first trivial mode).
+    Embedding: Psi_k = (lambda_k)^t * u_k.
+    Returns (embedding[N,m], lambdas[m]).
+    """
+    d = np.asarray(K.sum(axis=1)).reshape(-1)
+    d[d <= 1e-30] = 1e-30
+    inv_sqrt_d = 1.0 / np.sqrt(d)
+    S = (inv_sqrt_d[:, None] * K) * inv_sqrt_d[None, :]
+    vals, vecs = np.linalg.eigh(S)  # ascending
+    idx = np.argsort(vals)[::-1]
+    vals = vals[idx]
+    vecs = vecs[:, idx]
+    m_eff = max(1, min(m, vecs.shape[1] - 1))
+    lambdas = vals[1:1 + m_eff]
+    U = vecs[:, 1:1 + m_eff]
+    emb = U * (lambdas[None, :] ** max(1, t))
+    return emb.astype(np.float32), lambdas.astype(np.float32)
+
+
+def pairwise_euclidean_distance(X: np.ndarray) -> np.ndarray:
+    """Pairwise Euclidean distances for X[N,d]."""
+    N = X.shape[0]
+    G = X @ X.T
+    nrm = np.sum(X * X, axis=1, keepdims=True)
+    D2 = np.clip(nrm + nrm.T - 2.0 * G, 0.0, None)
+    D = np.sqrt(D2, dtype=np.float32)
+    return D
+
+
+# -------------------------------
+# Classic helpers (kept)
+# -------------------------------
 
 def cluster_with_hdbscan(dm: np.ndarray, min_cluster_size: int) -> np.ndarray:
     """Run HDBSCAN clustering on a precomputed distance matrix."""
@@ -273,11 +422,11 @@ def collapse_identical_vectors(mat: np.ndarray, idx: List[int]) -> Tuple[np.ndar
 def energy_to_weights(E: np.ndarray, beta: float = 2.0) -> np.ndarray:
     """Map energy to clustering weights: lower energy -> larger weight."""
     N = len(E)
-    ranks = E.argsort().argsort().astype(np.float64)  # 0=lowest energy
+    ranks = E.argsort().argsort().astype(np.float64)
     r = ranks / max(1, N - 1)
     w = np.exp(-beta * r)
     w = np.clip(w, 1e-8, None)
-    w = w * (N / w.sum())  # normalize to mean ~1
+    w = w * (N / w.sum())
     return w
 
 
@@ -441,7 +590,6 @@ def pick_k_balanced(dm: np.ndarray, rng: np.random.RandomState, k_candidates: Se
 
     for k in k_candidates:
         labels_u, _ = pam_kmedoids(dm, k, rng)
-        # max cluster fraction by weights
         frac = 0.0
         for c in np.unique(labels_u):
             if c == -1:
@@ -493,7 +641,7 @@ def choose_best_cluster(stats: pd.DataFrame) -> Optional[int]:
 # -------------------------------
 
 class ClusterAnalyzer:
-    """Cluster on main_vectors with Hamming/energy-guided distance and pick the best-energy cluster."""
+    """Energy–Geometry Diffusion Clustering on backbone positions with energy-aware kernel."""
     def __init__(self, cfg: ClusterConfig):
         self.cfg = cfg
         self.cfg.normalize()
@@ -506,6 +654,7 @@ class ClusterAnalyzer:
         self.stats_: Optional[pd.DataFrame] = None
         self.best_cluster_id_: Optional[int] = None
         self.best_member_indices_: Optional[List[int]] = None
+        self.embedding_: Optional[np.ndarray] = None
         self.rng = np.random.RandomState(self.cfg.random_seed)
 
     # ---- data I/O ----
@@ -541,7 +690,20 @@ class ClusterAnalyzer:
         self.vec_mat = mat
         self.valid_idx = valid_idx
 
-    def _distance_matrix(self):
+    def _prepare_positions(self, idx: List[int]) -> np.ndarray:
+        assert self.df_ is not None
+        if self.cfg.positions_col not in self.df_.columns:
+            raise ValueError(f"Column {self.cfg.positions_col} not found.")
+        pos_all, valid_idx2 = extract_positions(self.df_, self.cfg.positions_col)
+        # map idx to rows in positions tensor
+        mapper = {orig_i: k for k, orig_i in enumerate(valid_idx2)}
+        rows = [mapper[i] for i in idx if i in mapper]
+        if len(rows) != len(idx):
+            raise RuntimeError("Positions index mismatch.")
+        pos = pos_all[rows]
+        return pos
+
+    def _distance_matrix_hamming(self):
         assert self.vec_mat is not None
         self.dm_ = hamming_distance_matrix(self.vec_mat)
 
@@ -553,7 +715,7 @@ class ClusterAnalyzer:
             raise RuntimeError("No rows after prefilter.")
         self._prepare_vectors()
 
-        # optional: energy-quantile preselection (low-energy portion only)
+        # optional: energy-quantile preselection
         if self.cfg.energy_quantile_for_clustering is not None:
             ek = self.cfg.energy_key
             if ek not in self.df_.columns:
@@ -565,28 +727,53 @@ class ClusterAnalyzer:
             self.vec_mat = self.vec_mat[keep_mask]
             self.valid_idx = list(idx_valid[keep_mask])
 
-        # ---- unique-level clustering (recommended) ----
+        # unique-level consolidation by main_vectors
         if self.cfg.collapse_identical:
             mat_u, groups, freq_w = collapse_identical_vectors(self.vec_mat, self.valid_idx)
 
-            # representative energy per unique vector: median over its group
             ek = self.cfg.energy_key
             if ek not in self.df_.columns:
                 raise ValueError(f"Energy key {ek} not found in data.")
             colE = self.df_[ek].astype(float)
             E_u = np.array([float(np.median(colE.iloc[grp].values)) for grp in groups], dtype=np.float64)
 
-            # base distances (Hamming on unique vectors)
-            dm_u_ham = hamming_distance_matrix(mat_u)
+            # pick representative positions per unique vector: choose median-energy member
+            rep_indices = []
+            for grp in groups:
+                es = colE.iloc[grp].values.astype(float)
+                mid_rank = np.argsort(es)[len(es)//2]
+                rep_indices.append(grp[mid_rank])
 
-            # composite distance (C1)
-            if self.cfg.use_energy_in_distance:
-                dm_u = combine_distance(dm_u_ham, E_u, alpha=self.cfg.energy_alpha,
-                                        method=self.cfg.energy_distance_method)
+            pos_all, valid_idx_pos = extract_positions(self.df_, self.cfg.positions_col)
+            mapper = {orig_i: k for k, orig_i in enumerate(valid_idx_pos)}
+            rep_rows = [mapper[i] for i in rep_indices if i in mapper]
+            if len(rep_rows) != len(rep_indices):
+                raise RuntimeError("Positions/indices mismatch when selecting representatives.")
+            POS_u = pos_all[rep_rows]  # (M,L,3)
+
+            if self.cfg.distance_model == "geom_diffusion":
+                dm_geom = rmsd_distance_matrix(POS_u)
+                K = build_energy_geometry_kernel(dm_geom, E_u,
+                                                 eps=self.cfg.geom_kernel_eps,
+                                                 kT=self.cfg.temperature_kT,
+                                                 knn=self.cfg.knn)
+                emb, lambdas = diffusion_map_embedding_from_kernel(
+                    K, t=int(self.cfg.diffusion_time), m=int(self.cfg.embedding_dim)
+                )
+                self.embedding_ = emb
+                dm_embed = pairwise_euclidean_distance(emb)
+                dm_u = dm_embed
+                if self.cfg.use_energy_in_distance:
+                    dm_u = combine_distance(dm_embed, E_u, alpha=self.cfg.energy_alpha,
+                                            method=self.cfg.energy_distance_method)
             else:
+                dm_u_ham = hamming_distance_matrix(mat_u)
                 dm_u = dm_u_ham
+                if self.cfg.use_energy_in_distance:
+                    dm_u = combine_distance(dm_u_ham, E_u, alpha=self.cfg.energy_alpha,
+                                            method=self.cfg.energy_distance_method)
 
-            # choose k with balance (use frequency weights for diagnostics)
+            # select k and cluster (unique level)
             if self.cfg.use_weighted_pam:
                 w_energy = energy_to_weights(E_u, beta=self.cfg.energy_weight_beta)
                 w_cluster = freq_w * w_energy
@@ -608,7 +795,7 @@ class ClusterAnalyzer:
                 )
                 labels_u, _ = pam_kmedoids(dm_u, best_k, self.rng)
 
-            # expand back to sample-level labels
+            # expand to sample level
             labels_full = np.empty(sum(len(g) for g in groups), dtype=int)
             ptr = 0
             for cid, grp in zip(labels_u, groups):
@@ -616,22 +803,45 @@ class ClusterAnalyzer:
                 ptr += len(grp)
             self.labels_ = labels_full
 
-            # keep Hamming (unique) for optional later diagnostics
-            self.dm_ = dm_u_ham
+            # store a diagnostic distance matrix
+            if self.cfg.distance_model == "geom_diffusion":
+                self.dm_ = dm_geom.astype(np.float32)
+            else:
+                self.dm_ = dm_u.astype(np.float32)
 
         else:
-            # fallback: no collapsing (not recommended on highly duplicated data)
-            self._distance_matrix()
-            dm = self.dm_
-            assert dm is not None
+            # sample-level path (not recommended for highly duplicated data)
+            if self.cfg.distance_model == "geom_diffusion":
+                pos_all, valid_idx_pos = extract_positions(self.df_, self.cfg.positions_col)
+                mapper = {orig_i: k for k, orig_i in enumerate(valid_idx_pos)}
+                rows = [mapper[i] for i in self.valid_idx if i in mapper]
+                if len(rows) != len(self.valid_idx):
+                    raise RuntimeError("Positions index mismatch on sample-level path.")
+                POS = pos_all[rows]
+                E = self.df_.iloc[self.valid_idx][self.cfg.energy_key].astype(float).values
+
+                dm_geom = rmsd_distance_matrix(POS)
+                K = build_energy_geometry_kernel(dm_geom, E,
+                                                 eps=self.cfg.geom_kernel_eps,
+                                                 kT=self.cfg.temperature_kT,
+                                                 knn=self.cfg.knn)
+                emb, lambdas = diffusion_map_embedding_from_kernel(
+                    K, t=int(self.cfg.diffusion_time), m=int(self.cfg.embedding_dim)
+                )
+                self.embedding_ = emb
+                dm_embed = pairwise_euclidean_distance(emb)
+                dm = dm_embed
+                if self.cfg.use_energy_in_distance:
+                    dm = combine_distance(dm_embed, E, alpha=self.cfg.energy_alpha,
+                                          method=self.cfg.energy_distance_method)
+            else:
+                self._distance_matrix_hamming()
+                dm = self.dm_
+                E = self.df_.iloc[self.valid_idx][self.cfg.energy_key].astype(float).values
+                if self.cfg.use_energy_in_distance:
+                    dm = combine_distance(dm, E, alpha=self.cfg.energy_alpha, method=self.cfg.energy_distance_method)
+
             n = dm.shape[0]
-
-            # optionally blend energy into distance
-            if self.cfg.use_energy_in_distance:
-                ek = self.cfg.energy_key
-                E = self.df_.iloc[self.valid_idx][ek].astype(float).values
-                dm = combine_distance(dm, E, alpha=self.cfg.energy_alpha, method=self.cfg.energy_distance_method)
-
             if n < 2:
                 self.labels_ = np.zeros(n, dtype=int)
             else:
@@ -640,8 +850,6 @@ class ClusterAnalyzer:
                     self.labels_ = cluster_with_hdbscan(dm, min_cs)
                 else:
                     if self.cfg.use_weighted_pam:
-                        ek = self.cfg.energy_key
-                        E = self.df_.iloc[self.valid_idx][ek].astype(float).values
                         w = energy_to_weights(E, beta=self.cfg.energy_weight_beta)
                         best_k, _ = pick_k_balanced(dm, self.rng, self.cfg.k_candidates, weights=w,
                                                     max_cluster_frac=self.cfg.max_cluster_frac,
@@ -649,7 +857,6 @@ class ClusterAnalyzer:
                                                     penalty_lambda=self.cfg.penalty_lambda)
                         labels, _ = pam_kmedoids_weighted(dm, best_k, self.rng, weights=w)
                     else:
-                        # plain k-medoids with silhouette-driven k
                         best_k = None
                         best_score = -1.0
                         for k in self.cfg.k_candidates:
@@ -660,8 +867,9 @@ class ClusterAnalyzer:
                                 best_k = k
                         labels, _ = pam_kmedoids(dm, int(best_k), self.rng)
                     self.labels_ = labels
+            self.dm_ = dm.astype(np.float32)
 
-        # ---- energy stats & pick best cluster by energy ----
+        # energy stats and best cluster selection
         assert self.labels_ is not None
         working_df = self.df_.iloc[self.valid_idx].copy()
         if self.cfg.energy_key not in working_df.columns:
@@ -711,6 +919,12 @@ class ClusterAnalyzer:
             "min_cluster_size": self.cfg.min_cluster_size,
             "k_candidates": list(self.cfg.k_candidates),
             "energy_key": self.cfg.energy_key,
+            "distance_model": self.cfg.distance_model,
+            "geom_kernel_eps": self.cfg.geom_kernel_eps,
+            "knn": self.cfg.knn,
+            "temperature_kT": self.cfg.temperature_kT,
+            "diffusion_time": self.cfg.diffusion_time,
+            "embedding_dim": self.cfg.embedding_dim,
             "n_rows_after_prefilter": int(len(self.df_)),
             "n_valid_for_vectors": int(len(self.valid_idx)),
             "best_cluster_id": None if self.best_cluster_id_ is None else int(self.best_cluster_id_),
