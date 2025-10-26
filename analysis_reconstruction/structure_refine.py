@@ -27,7 +27,7 @@ class RefineConfig:
     random_seed: int = 0
 
     # anchor/medoid selection
-    anchor_policy: str = "lowest_energy"  # "lowest_energy" | "hamming_medoid"
+    anchor_policy: str = "lowest_energy"  # "lowest_energy" | "hamming_medoid" (fallback to lowest_energy)
 
     # refining mode
     refine_mode: str = "standard"         # "fast" | "standard" | "premium"
@@ -47,11 +47,11 @@ class RefineConfig:
     weight_eps: float = 1e-9
 
     # continuous mean & projection (geometry)
-    gpa_iters: int = 1                # we still allow 1 round of re-align to a proto-mean
+    gpa_iters: int = 3                # true GPA iterations
     proj_enforce_bond: bool = True
     target_ca_distance: Optional[float] = 3.8  # Å
-    proj_smooth_strength: float = 0.03         # weaker smoothing to avoid collapse
-    proj_iters: int = 10
+    proj_smooth_strength: float = 0.02         # mild smoothing to avoid shrink
+    proj_iters: int = 8
     min_separation: float = 3.0                # Cα-only non-neighbor collision threshold
 
     # local polishing (optional if energy_fn provided)
@@ -65,9 +65,12 @@ class RefineConfig:
 
     def normalize(self):
         self.refine_mode = str(self.refine_mode).lower().strip()
-        self.anchor_policy = str(self.anchor_policy).lower().strip()
         if self.refine_mode not in ("fast", "standard", "premium"):
             self.refine_mode = "standard"
+        self.anchor_policy = str(self.anchor_policy).lower().strip()
+        if self.anchor_policy not in ("lowest_energy", "hamming_medoid"):
+            logging.warning("Unknown anchor_policy=%r; fallback to 'lowest_energy'", self.anchor_policy)
+            self.anchor_policy = "lowest_energy"
 
 
 # -------------------------------
@@ -136,21 +139,10 @@ def pairwise_rmsd_sum(X_list: List[np.ndarray]) -> np.ndarray:
     return sums
 
 
-def sample_weights(row: pd.Series, wcfg: Dict[str, float], eps: float = 1e-9) -> float:
-    """Compute exp(-alpha_k * E_k ...). Larger energy -> smaller weight."""
-    val = 0.0
-    for k, alpha in wcfg.items():
-        if k in row and pd.notna(row[k]):
-            val += alpha * float(row[k])
-    # soft clamp to prevent exp overflow
-    val = min(max(val, -50.0), 50.0)
-    w = math.exp(-val)
-    return max(w, eps)
-
-
 def write_pdb_ca(path: str, coords: np.ndarray, sequence: Optional[str] = None, chain_id: str = "A"):
     """Write Cα-only PDB (ATOM records). seqres optional; residue names fallback to 'GLY'."""
     with open(path, "w", encoding="utf-8") as f:
+        # TODO: optionally use sequence to map residue names
         resn = "GLY"
         for i, (x, y, z) in enumerate(coords, start=1):
             f.write(
@@ -262,6 +254,23 @@ def qc_geometry(coords: np.ndarray, min_sep_nonadj: float = 2.8) -> Dict[str, fl
     }
 
 
+def _moving_average_1d(D: np.ndarray, win: int = 3) -> np.ndarray:
+    """Light 1D moving average over the edge sequence for direction fields."""
+    if win <= 1:
+        return D
+    k = int(win)
+    if k % 2 == 0:
+        k += 1
+    m = (k - 1) // 2
+    Lm1 = D.shape[0]
+    out = D.copy()
+    for i in range(Lm1):
+        s = max(0, i - m)
+        t = min(Lm1, i + m + 1)
+        out[i] = D[s:t].mean(axis=0)
+    return out
+
+
 # -------------------------------
 # Main class
 # -------------------------------
@@ -304,7 +313,7 @@ class StructureRefiner:
 
         self._subsample_cluster()
         if len(self.sub_df) == 0:
-            raise RuntimeError("No rows Pdbbind for refinement.")
+            raise RuntimeError("No rows for refinement.")
 
         self._select_anchor()
         self._align_to_anchor()
@@ -319,7 +328,7 @@ class StructureRefiner:
 
         # standard/premium: build continuous mean (by averaged directions) and project
         self.medoid_ca = self.aligned_list[self.medoid_idx_in_sub].copy()
-        self._continuous_mean()      # now does direction-averaging + 3.8Å reconstruction
+        self._continuous_mean()      # direction-averaging + 3.8Å reconstruction
         self._project_geometry()
 
         if self.cfg.refine_mode == "premium":
@@ -394,14 +403,13 @@ class StructureRefiner:
 
         anchor_row = df.loc[self.anchor_idx]
         anchor = anchor_row["_parsed_positions"]
-        L = anchor.shape[0]
+        L_anchor = anchor.shape[0]
 
         aligned = []
         for _, row in df.iterrows():
             X = row["_parsed_positions"]
-            if X.shape[0] != L:
-                # simple trimming to minimal length
-                Lmin = min(L, X.shape[0])
+            if X.shape[0] != L_anchor:
+                Lmin = min(L_anchor, X.shape[0])
                 ref = anchor[:Lmin]
                 tgt = X[:Lmin]
                 aligned_X = align_to_reference(ref, tgt)
@@ -410,13 +418,15 @@ class StructureRefiner:
             aligned.append(aligned_X)
         self.aligned_list = aligned
 
-        # one optional GPA iteration to stabilize orientation around a proto-mean
-        if self.cfg.gpa_iters > 0:
-            mean0 = np.mean(np.stack(self.aligned_list, axis=0), axis=0)
+        # true GPA iterations with (later) energy-weighted mean
+        # initial unweighted proto-mean
+        mean0 = np.mean(np.stack(self.aligned_list, axis=0), axis=0)
+        for _ in range(max(0, self.cfg.gpa_iters)):
             new_list = []
             for X in self.aligned_list:
                 new_list.append(align_to_reference(mean0, X))
             self.aligned_list = new_list
+            mean0 = np.mean(np.stack(self.aligned_list, axis=0), axis=0)
 
     def _select_medoid(self):
         aligned = self.aligned_list
@@ -424,32 +434,74 @@ class StructureRefiner:
         idx = int(np.argmin(sums))
         self.medoid_idx_in_sub = idx
 
+    def _robust_energy_weights(self) -> np.ndarray:
+        """
+        Build robust standardized energy vector and return softmax-like weights.
+        Uses IQR-based scaling per energy key to mitigate unit/scale effects.
+        """
+        cfg = self.cfg
+        M = len(self.sub_df)
+        # collect per-key energy arrays
+        keys = [k for k in cfg.energy_weights.keys() if k in self.sub_df.columns]
+        if not keys:
+            # fallback to 1/M uniform
+            return np.full(M, 1.0 / M, dtype=float)
+
+        E_mat = []
+        alphas = []
+        for k in keys:
+            v = self.sub_df[k].astype(float).to_numpy()
+            q1 = np.nanpercentile(v, 25.0)
+            q3 = np.nanpercentile(v, 75.0)
+            iqr = max(q3 - q1, 1e-8)
+            z = (v - np.nanmedian(v)) / iqr  # robust z
+            E_mat.append(z)
+            alphas.append(float(cfg.energy_weights.get(k, 1.0)))
+        E_mat = np.stack(E_mat, axis=1)  # (M, K)
+        alphas = np.asarray(alphas, dtype=float)  # (K,)
+
+        score = (E_mat * alphas[None, :]).sum(axis=1)  # higher => worse
+        # temperature for softmax
+        tau = 1.0
+        score = np.clip(score, -50.0, 50.0)
+        w = np.exp(-score / tau)
+        w = np.maximum(w, cfg.weight_eps)
+        w /= w.sum() + 1e-12
+        return w
+
     def _continuous_mean(self, extra_iters: int = 0):
         """
         Build a continuous mean by averaging unit directions and reconstructing
-        with a fixed Cα step (default 3.8 Å) from the anchor start point.
+        with a fixed Cα step (default 3.8 Å) from the medoid start point.
         """
         cfg = self.cfg
         assert self.aligned_list is not None
         L = self.aligned_list[0].shape[0]
 
-        # sample weights by energy (softmax-like via exp(-sum alpha E))
-        W = []
-        for _, row in self.sub_df.iterrows():
-            w = sample_weights(row, cfg.energy_weights, cfg.weight_eps)
-            W.append(w)
-        W = np.asarray(W, dtype=float)
-        W /= W.sum() + 1e-12
+        # robust, energy-aware sample weights
+        W = self._robust_energy_weights()  # (M,)
 
         # compute unit edge directions for each aligned sample
         dirs_list = []
         for X in self.aligned_list:
             D = unit_directions_from_coords(X)  # (L-1,3)
+            # light 1D smoothing on each sample's direction field
+            D = _moving_average_1d(D, win=3)
+            # renormalize
+            n = np.linalg.norm(D, axis=1, keepdims=True)
+            n = np.maximum(n, 1e-12)
+            D = D / n
             dirs_list.append(D)
         D_all = np.stack(dirs_list, axis=0)     # (M, L-1, 3)
 
         # energy-weighted mean direction and re-normalize per edge
         Dbar = (W[:, None, None] * D_all).sum(axis=0)  # (L-1,3)
+        norms = np.linalg.norm(Dbar, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        Dbar = Dbar / norms
+
+        # extra mild smoothing on the averaged direction field
+        Dbar = _moving_average_1d(Dbar, win=3)
         norms = np.linalg.norm(Dbar, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-12)
         Dbar = Dbar / norms
@@ -466,45 +518,47 @@ class StructureRefiner:
 
     def _project_geometry(self):
         """
-        Projection: strong neighbor enforcement -> light smoothing -> repulsion,
-        repeated for cfg.proj_iters; finally do an arc-length reconstruction to
-        lock all Cα-Cα distances to the target step.
+        Projection loop:
+          (1) light smoothing
+          (2) neighbor distance enforcement
+          (3) non-neighbor repulsion
+          (4) immediate arc-length reconstruction to lock all Cα-Cα distances
+        and finally a post-pass to resolve residual close contacts.
         """
         cfg = self.cfg
         assert self.mean_ca is not None
         X = self.mean_ca.copy()
 
-        # set target Cα distance
         d0 = float(cfg.target_ca_distance or 3.8)
 
         for _ in range(cfg.proj_iters):
+            # 1) light smoothing (avoid too large shrink)
+            X = laplacian_smooth(X, cfg.proj_smooth_strength)
+
+            # 2) enforce neighbor distance to target
             if cfg.proj_enforce_bond:
-                X = enforce_neighbor_distance(X, d0, iters=10)        # strong
-            X = laplacian_smooth(X, cfg.proj_smooth_strength)         # light
+                X = enforce_neighbor_distance(X, target=d0, iters=10)
+
+            # 3) repel non-neighbors
             X = repel_min_separation(X, cfg.min_separation, factor=0.15)
 
-        # exit insurance: arc-length reconstruction at exact d0
-        D = unit_directions_from_coords(X)
-        X_fixed = reconstruct_by_dirs(X[0], D, d0)
-        self.projected_ca = X_fixed
+            # 4) lock step length by arc-length reconstruction
+            D = unit_directions_from_coords(X)
+            X = reconstruct_by_dirs(X[0], D, d0)
 
-        D = unit_directions_from_coords(X)
-        X_fixed = reconstruct_by_dirs(X[0], D, d0)
-
-        # --- NEW: post-pass to resolve residual close contacts ---
-        for _ in range(5):  # a few safety passes
-            # quick QC
-            min_nonadj = np.inf
+        # final close-contact safety passes
+        X_fixed = X.copy()
+        for _ in range(5):
             L = X_fixed.shape[0]
+            min_nonadj = np.inf
             for i in range(L):
                 for j in range(i + 2, L):
                     dij = np.linalg.norm(X_fixed[j] - X_fixed[i])
                     if dij < min_nonadj:
                         min_nonadj = dij
-            if min_nonadj >= self.cfg.min_separation:
+            if min_nonadj >= cfg.min_separation:
                 break
-            # repel & re-lock
-            X_fixed = repel_min_separation(X_fixed, self.cfg.min_separation, factor=0.25)
+            X_fixed = repel_min_separation(X_fixed, cfg.min_separation, factor=0.25)
             D = unit_directions_from_coords(X_fixed)
             X_fixed = reconstruct_by_dirs(X_fixed[0], D, d0)
 
@@ -518,7 +572,8 @@ class StructureRefiner:
             return
 
         Z = self.projected_ca.copy()
-        Q = self.projected_ca.copy()
+        Q_ref = self.projected_ca.copy()
+        d0 = float(cfg.target_ca_distance or 3.8)
 
         def energy_total(coords: np.ndarray) -> float:
             try:
@@ -532,6 +587,7 @@ class StructureRefiner:
             self.refined_ca = self.projected_ca.copy()
             return
 
+        # finite-diff gradient with simple backtracking line search
         for _ in range(max(1, cfg.local_polish_steps)):
             grad = np.zeros_like(Z)
             # finite difference gradient
@@ -546,24 +602,33 @@ class StructureRefiner:
                         grad[i, k] = (e_plus - e_minus) / (2 * cfg.step_size)
 
             # add stay term gradient
-            grad += 2.0 * cfg.stay_lambda * (Z - Q)
+            grad += 2.0 * cfg.stay_lambda * (Z - Q_ref)
 
-            # take a small step
-            Z_new = Z - 0.1 * grad
-            # projection-lite to keep geometry sane
-            Z_new = enforce_neighbor_distance(Z_new, d0=cfg.target_ca_distance or 3.8, iters=2)
-            Z_new = repel_min_separation(Z_new, self.cfg.min_separation, factor=0.10)
+            # line search
+            step = 0.1
+            improved = False
+            for _ls in range(8):
+                Z_new = Z - step * grad
+                # light projection to keep geometry sane
+                Z_new = enforce_neighbor_distance(Z_new, target=d0, iters=2)
+                Z_new = repel_min_separation(Z_new, self.cfg.min_separation, factor=0.10)
+                D = unit_directions_from_coords(Z_new)
+                Z_new = reconstruct_by_dirs(Z_new[0], D, d0)
 
-            e_new = energy_total(Z_new)
-            if np.isfinite(e_new) and e_new <= base_e:
-                Z = Z_new
-                base_e = e_new
-            else:
+                e_new = energy_total(Z_new)
+                if np.isfinite(e_new) and e_new <= base_e:
+                    Z = Z_new
+                    base_e = e_new
+                    improved = True
+                    break
+                step *= 0.5
+
+            if not improved:
                 break
 
         # final lock by arc-length reconstruction
         D = unit_directions_from_coords(Z)
-        self.refined_ca = reconstruct_by_dirs(Z[0], D, float(cfg.target_ca_distance or 3.8))
+        self.refined_ca = reconstruct_by_dirs(Z[0], D, d0)
 
     # ---- outputs ----
 
