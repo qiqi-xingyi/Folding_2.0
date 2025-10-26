@@ -26,7 +26,7 @@ class EnergyConfig:
     d0: float = 1.0
     lambda_overlap: float = 1000.0
     weights: Dict[str, float] = field(
-        default_factory=lambda: {"steric": 1.0, "geom": 0.5, "bond": 0.2, "mj": 1.0}
+        default_factory=lambda: {"steric": 1.0, "geom": 0.5, "bond": 0.2, "mj": 2.0}
     )
     normalize: bool = True
     output_path: str = "decoded_with_energy.jsonl"
