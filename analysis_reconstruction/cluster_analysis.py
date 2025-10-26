@@ -45,7 +45,7 @@ class ClusterConfig:
     # ---- energy-guided clustering (C) ----
     # C1: use energy in distance
     use_energy_in_distance: bool = True
-    energy_alpha: float = 0.8               # d = alpha*Hamming + (1-alpha)*EnergyDiff
+    energy_alpha: float = 0.4               # d = alpha*Hamming + (1-alpha)*EnergyDiff
     energy_distance_method: str = "rank"    # "rank" | "mad"
 
     # C2: weighted PAM (energy->weights)
