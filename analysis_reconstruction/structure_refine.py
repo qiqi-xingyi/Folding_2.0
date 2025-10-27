@@ -47,18 +47,18 @@ class RefineConfig:
     weight_eps: float = 1e-9
 
     # continuous mean & projection (geometry)
-    gpa_iters: int = 3                # true GPA iterations
+    gpa_iters: int = 3
     proj_enforce_bond: bool = True
     target_ca_distance: Optional[float] = 3.8  # Å
-    proj_smooth_strength: float = 0.02         # mild smoothing to avoid shrink
+    proj_smooth_strength: float = 0.02
     proj_iters: int = 8
-    min_separation: float = 3.0                # Cα-only non-neighbor collision threshold
+    min_separation: float = 3.0
 
     # local polishing (optional if energy_fn provided)
     do_local_polish: bool = False
     local_polish_steps: int = 20
     stay_lambda: float = 0.05
-    step_size: float = 0.05              # Å for finite-diff gradients if energy_fn provided
+    step_size: float = 0.05  # Å for finite-diff gradients if energy_fn provided
 
     # output
     output_dir: str = "./refine_out"
@@ -142,7 +142,6 @@ def pairwise_rmsd_sum(X_list: List[np.ndarray]) -> np.ndarray:
 def write_pdb_ca(path: str, coords: np.ndarray, sequence: Optional[str] = None, chain_id: str = "A"):
     """Write Cα-only PDB (ATOM records). seqres optional; residue names fallback to 'GLY'."""
     with open(path, "w", encoding="utf-8") as f:
-        # TODO: optionally use sequence to map residue names
         resn = "GLY"
         for i, (x, y, z) in enumerate(coords, start=1):
             f.write(
@@ -186,7 +185,6 @@ def enforce_neighbor_distance(coords: np.ndarray, target: float, iters: int = 1)
             v = b - a
             d = np.linalg.norm(v)
             if d < 1e-12:
-                # tiny random nudge to avoid zero-length edges
                 v = np.array([1e-6, 0.0, 0.0], dtype=float)
                 d = 1e-6
             delta = (target - d) * 0.5
@@ -237,7 +235,6 @@ def qc_geometry(coords: np.ndarray, min_sep_nonadj: float = 2.8) -> Dict[str, fl
     """Simple geometry QC metrics."""
     dif = coords[1:] - coords[:-1]
     dists = np.linalg.norm(dif, axis=1)
-    # min distance among non-neighbor pairs
     L = coords.shape[0]
     min_nonadj = np.inf
     for i in range(L):
@@ -333,16 +330,15 @@ class StructureRefiner:
             self.report = self._build_report()
             return
 
-        # standard/premium: build continuous mean (by averaged directions) and project
+        # standard/premium: build continuous mean and project
         self.medoid_ca = self.aligned_list[self.medoid_idx_in_sub].copy()
-        self._continuous_mean()      # direction-averaging + 3.8Å reconstruction
+        self._continuous_mean()
         self._project_geometry()
 
         if self.cfg.refine_mode == "premium":
-            # minor extra pass
             self._project_geometry()
 
-        # optional local polishing with energy function
+        # optional local polishing
         if self.cfg.do_local_polish and self.energy_fn is not None:
             self._local_energy_polish()
             final = self.refined_ca
@@ -401,7 +397,6 @@ class StructureRefiner:
         if cfg.anchor_policy == "lowest_energy":
             self.anchor_idx = int(df[cfg.energy_key].astype(float).idxmin())
         else:
-            # fallback to lowest energy
             self.anchor_idx = int(df[cfg.energy_key].astype(float).idxmin())
 
     def _align_to_anchor(self):
@@ -458,13 +453,13 @@ class StructureRefiner:
             q1 = np.nanpercentile(v, 25.0)
             q3 = np.nanpercentile(v, 75.0)
             iqr = max(q3 - q1, 1e-8)
-            z = (v - np.nanmedian(v)) / iqr  # robust z
+            z = (v - np.nanmedian(v)) / iqr
             E_mat.append(z)
             alphas.append(float(cfg.energy_weights.get(k, 1.0)))
         E_mat = np.stack(E_mat, axis=1)  # (M, K)
         alphas = np.asarray(alphas, dtype=float)  # (K,)
 
-        score = (E_mat * alphas[None, :]).sum(axis=1)  # higher => worse
+        score = (E_mat * alphas[None, :]).sum(axis=1)
         tau = 1.0
         score = np.clip(score, -50.0, 50.0)
         w = np.exp(-score / tau)
@@ -472,56 +467,60 @@ class StructureRefiner:
         w /= w.sum() + 1e-12
         return w
 
+    # =========================
+    # PATCH A: medoid-neighborhood averaging (no trimming across modes)
+    # =========================
     def _continuous_mean(self, extra_iters: int = 0):
         """
-        Build a continuous mean by averaging unit directions (robust, trimmed) and reconstructing
-        with a fixed Cα step (default 3.8 Å) from the medoid start point.
+        Build a continuous mean by averaging unit directions on the medoid neighborhood only,
+        then reconstruct with a fixed Cα step from the medoid start point.
         """
         cfg = self.cfg
         assert self.aligned_list is not None
+        assert self.medoid_idx_in_sub is not None
         L = self.aligned_list[0].shape[0]
 
-        # robust, energy-aware sample weights
-        W = self._robust_energy_weights()  # (M,)
+        # 0) define a single-mode neighborhood around the medoid by RMSD threshold
+        med = self.aligned_list[self.medoid_idx_in_sub]
+        rmsds = np.array([rmsd(med, X) for X in self.aligned_list], dtype=float)
+        thr = np.nanpercentile(rmsds, 60.0)
+        keep_idx = np.where(rmsds <= thr)[0]
+        if len(keep_idx) < max(8, int(0.15 * len(self.aligned_list))):
+            order = np.argsort(rmsds)
+            K = max(8, int(0.15 * len(self.aligned_list)))
+            keep_idx = order[:K]
 
-        # compute unit edge directions for each aligned sample, light smoothing per sample
+        # 1) robust energy weights restricted to neighborhood
+        W_full = self._robust_energy_weights()  # (M,)
+        W = W_full[keep_idx]
+        W = W / (W.sum() + 1e-12)
+
+        # 2) per-sample direction fields with light smoothing (neighborhood only)
         dirs_list = []
-        for X in self.aligned_list:
+        for i in keep_idx:
+            X = self.aligned_list[i]
             D = unit_directions_from_coords(X)  # (L-1,3)
             D = _moving_average_1d(D, win=3)
             n = np.linalg.norm(D, axis=1, keepdims=True)
             n = np.maximum(n, 1e-12)
             D = D / n
             dirs_list.append(D)
-        D_all = np.stack(dirs_list, axis=0)     # (M, L-1, 3)
+        D_all = np.stack(dirs_list, axis=0)     # (M_keep, L-1, 3)
 
-        # energy-weighted raw mean unit direction
-        Dbar_raw = (W[:, None, None] * D_all).sum(axis=0)  # (L-1,3)
-        nr = np.linalg.norm(Dbar_raw, axis=1, keepdims=True)
-        nr = np.maximum(nr, 1e-12)
-        Dbar_unit = Dbar_raw / nr  # (L-1,3)
-
-        # trimmed mean (discard 20% worst by angular deviation)
-        M, Lm1, _ = D_all.shape
-        keep_k = max(1, int(round(M * 0.8)))
-        Dbar = np.zeros_like(Dbar_unit)
-        for e in range(Lm1):
-            u = Dbar_unit[e]                       # (3,)
-            dots = (D_all[:, e, :] @ u)            # (M,)
-            idx = np.argsort(-dots)[:keep_k]       # top aligned
-            v = (W[idx, None] * D_all[idx, e, :]).sum(axis=0)
-            nv = np.linalg.norm(v) + 1e-12
-            Dbar[e] = v / nv
-
-        # light smoothing + renormalize
+        # 3) weighted mean without trimming (avoid cross-mode bias)
+        Dbar = (W[:, None, None] * D_all).sum(axis=0)  # (L-1,3)
+        norms = np.linalg.norm(Dbar, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-12)
+        Dbar = Dbar / norms
         Dbar = _moving_average_1d(Dbar, win=3)
         norms = np.linalg.norm(Dbar, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-12)
         Dbar = Dbar / norms
 
+        # 4) reconstruct from medoid's first Cα
         step = float(cfg.target_ca_distance or 3.8)
-        P0 = self.aligned_list[self.medoid_idx_in_sub][0] if self.medoid_idx_in_sub is not None else np.zeros(3)
-        self.mean_ca = reconstruct_by_dirs(P0, Dbar, step)  # (L,3)
+        P0 = med[0]
+        self.mean_ca = reconstruct_by_dirs(P0, Dbar, step)
 
     def _project_geometry(self):
         """
@@ -529,9 +528,8 @@ class StructureRefiner:
           (1) light smoothing
           (2) neighbor distance enforcement
           (3) non-neighbor repulsion
-          (4) immediate arc-length reconstruction to lock all Cα-Cα distances
-        and finally a post-pass to resolve residual close contacts;
-        then a variance-guided shrink toward medoid on high-uncertainty residues.
+          (4) arc-length reconstruction
+        Then final safety passes and a variance-guided mild shrink toward the medoid.
         """
         cfg = self.cfg
         assert self.mean_ca is not None
@@ -540,17 +538,10 @@ class StructureRefiner:
         d0 = float(cfg.target_ca_distance or 3.8)
 
         for _ in range(cfg.proj_iters):
-            # 1) light smoothing (avoid excessive shrink)
             X = laplacian_smooth(X, cfg.proj_smooth_strength)
-
-            # 2) enforce neighbor distance
             if cfg.proj_enforce_bond:
                 X = enforce_neighbor_distance(X, target=d0, iters=10)
-
-            # 3) repel non-neighbors
             X = repel_min_separation(X, cfg.min_separation, factor=0.15)
-
-            # 4) lock step length by arc-length reconstruction
             D = unit_directions_from_coords(X)
             X = reconstruct_by_dirs(X[0], D, d0)
 
@@ -570,11 +561,13 @@ class StructureRefiner:
             D = unit_directions_from_coords(X_fixed)
             X_fixed = reconstruct_by_dirs(X_fixed[0], D, d0)
 
-        # variance-guided shrink toward medoid on uncertain residues, then lock step
+        # =========================
+        # PATCH B: variance-guided mild shrink (capped at 0.2)
+        # =========================
         if self.aligned_list is not None and self.medoid_idx_in_sub is not None:
             var_s = _per_residue_std(self.aligned_list)     # (L,)
             m = np.median(var_s) + 1e-12
-            w = np.clip((var_s / (2.5 * m)) - 0.2, 0.0, 0.5)  # per-residue blend weight in [0,0.5]
+            w = np.clip((var_s / (2.5 * m)) - 0.2, 0.0, 0.2)  # cap at 0.2 (mild)
             med = self.aligned_list[self.medoid_idx_in_sub]
             X_blend = (1.0 - w[:, None]) * X_fixed + w[:, None] * med
             D = unit_directions_from_coords(X_blend)
@@ -606,29 +599,25 @@ class StructureRefiner:
             self.refined_ca = self.projected_ca.copy()
             return
 
-        # finite-diff gradient with simple backtracking line search
+        # finite-diff gradient with backtracking line search
         for _ in range(max(1, cfg.local_polish_steps)):
             grad = np.zeros_like(Z)
-            # finite difference gradient
             for i in range(Z.shape[0]):
                 for k in range(3):
                     Z[i, k] += cfg.step_size
                     e_plus = energy_total(Z)
                     Z[i, k] -= 2 * cfg.step_size
                     e_minus = energy_total(Z)
-                    Z[i, k] += cfg.step_size  # restore
+                    Z[i, k] += cfg.step_size
                     if np.isfinite(e_plus) and np.isfinite(e_minus):
                         grad[i, k] = (e_plus - e_minus) / (2 * cfg.step_size)
 
-            # add stay term gradient
             grad += 2.0 * cfg.stay_lambda * (Z - Q_ref)
 
-            # line search
             step = 0.1
             improved = False
             for _ls in range(8):
                 Z_new = Z - step * grad
-                # light projection to keep geometry sane
                 Z_new = enforce_neighbor_distance(Z_new, target=d0, iters=2)
                 Z_new = repel_min_separation(Z_new, self.cfg.min_separation, factor=0.10)
                 D = unit_directions_from_coords(Z_new)
@@ -645,7 +634,6 @@ class StructureRefiner:
             if not improved:
                 break
 
-        # final lock by arc-length reconstruction
         D = unit_directions_from_coords(Z)
         self.refined_ca = reconstruct_by_dirs(Z[0], D, d0)
 
@@ -670,7 +658,6 @@ class StructureRefiner:
         rep["n_used_for_refine"] = 0 if self.sub_df is None else int(len(self.sub_df))
         rep["mode"] = self.cfg.refine_mode
 
-        # geometry QC
         if self.refined_ca is not None:
             qc = qc_geometry(self.refined_ca, min_sep_nonadj=self.cfg.min_separation)
             rep.update({
@@ -687,18 +674,15 @@ class StructureRefiner:
             raise RuntimeError("Nothing to save. Run .run() first.")
         ensure_outdir(self.cfg.output_dir)
 
-        # choose sequence if available (optional)
         seq = None
         if self.cluster_df is not None and self.cfg.sequence_col in self.cluster_df.columns:
             seq = str(self.cluster_df.iloc[0][self.cfg.sequence_col])
 
-        # save PDB/CSV
         med = self.medoid_ca if self.medoid_ca is not None else self.refined_ca
         write_pdb_ca(os.path.join(self.cfg.output_dir, "medoid_ca.pdb"), med, seq)
         write_pdb_ca(os.path.join(self.cfg.output_dir, "refined_ca.pdb"), self.refined_ca, seq)
         write_csv_ca(os.path.join(self.cfg.output_dir, "refined_ca.csv"), self.refined_ca)
 
-        # report
         rep = dict(self.report)
         with open(os.path.join(self.cfg.output_dir, "refine_report.json"), "w", encoding="utf-8") as f:
             json.dump(rep, f, indent=2)
