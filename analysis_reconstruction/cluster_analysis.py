@@ -230,6 +230,26 @@ def extract_positions(df: pd.DataFrame, col: str) -> Tuple[np.ndarray, List[int]
     return pos, valid_idx
 
 
+def _has_overlap_single(P: np.ndarray, eps: float = 1e-8) -> bool:
+    N = P.shape[0]
+    if N < 3:
+        return False
+
+    for i in range(N):
+        for j in range(i+2, N):
+            if np.linalg.norm(P[i]-P[j]) < eps:
+                return True
+    return False
+
+def _filter_overlap_positions(pos_all: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+
+    M = pos_all.shape[0]
+    keep = np.ones(M, dtype=bool)
+    for m in range(M):
+        if _has_overlap_single(pos_all[m], eps=eps):
+            keep[m] = False
+    return keep
+
 def hamming_distance_matrix(mat: np.ndarray) -> np.ndarray:
     """Pairwise normalized Hamming distance for integer-coded sequences."""
     n, L = mat.shape
