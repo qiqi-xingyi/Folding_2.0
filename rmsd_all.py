@@ -4,8 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:rmsd_all.py
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 """
 find_best_rmsd.py
