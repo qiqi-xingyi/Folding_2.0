@@ -106,16 +106,18 @@ def build_chain_index(ca_list):
     return idx
 
 
-def extract_range_from_protein(protein_pdb: str, start: int, end: int) -> np.ndarray:
+def extract_range_candidates_per_chain(protein_pdb: str, start: int, end: int):
     """
-    From a full protein PDB, extract CA coords for residue numbers [start, end] on a single chain.
-    Try each chain; return the first chain that contains all residues in the range.
+    Return list of (chain_id, coords[L,3]) for all chains that can provide residues [start, end].
+    First try exact insertion code "" for all residues; if not possible, allow any insertion code per resseq.
     """
     ca = read_ca_coords_from_pdb(protein_pdb)
     chains = build_chain_index(ca)
-    keys_range = [(i, "") for i in range(start, end + 1)]  # ignore insertion code by default
+    keys_range = [(i, "") for i in range(start, end + 1)]
 
-    # strict pass: require exact (resseq, icode="")
+    candidates = []
+
+    # strict pass (icode="")
     for ch, mapping in chains.items():
         coords = []
         ok = True
@@ -126,7 +128,26 @@ def extract_range_from_protein(protein_pdb: str, start: int, end: int) -> np.nda
                 ok = False
                 break
         if ok:
-            return np.vstack(coords)
+            candidates.append((ch, np.vstack(coords)))
+
+    # fallback pass (any icode per resseq), but only if strict didn't return anything for that chain set
+    if not candidates:
+        for ch, mapping in chains.items():
+            coords = []
+            ok = True
+            for i in range(start, end + 1):
+                cand = [mapping[k] for k in mapping.keys() if k[0] == i]
+                if not cand:
+                    ok = False
+                    break
+                coords.append(cand[0])
+            if ok:
+                candidates.append((ch, np.vstack(coords)))
+
+    if not candidates:
+        raise RuntimeError(f"Could not extract residues {start}-{end} from {protein_pdb} on any chain.")
+    return candidates
+
 
     # fallback: allow insertion codes for each residue number (take the first)
     for ch, mapping in chains.items():
@@ -207,42 +228,52 @@ def main():
         protein_pdb = os.path.join(ref_dir, candidates[0])
 
     # Load ground-truth segment (CA)
-    gt_ca = extract_range_from_protein(protein_pdb, start, end)
-    L_gt = gt_ca.shape[0]
+    # Load ground-truth candidates (CA) for all chains
+    gt_candidates = extract_range_candidates_per_chain(protein_pdb, start, end)
 
-    # Load predicted CA (file order)
+    # Load predicted CA (file order) – this is Å, length L_pred
     pred_ca_list = read_ca_coords_from_pdb(pred_path)
     pred_ca = np.vstack([r["xyz"] for r in pred_ca_list])
     L_pred = pred_ca.shape[0]
 
-    if L_gt != seq_len:
-        print(f"[warn] Index says Sequence_length={seq_len}, extracted {L_gt} residues from protein ({start}-{end}).")
-    if L_pred != L_gt:
+    # We expect exact length match for a fragment; if not, truncate to min length
+    best = dict(val=float("inf"), chain=None, reversed=False, pred_aligned=None, gt_used=None)
+    for ch, gt_ca in gt_candidates:
+        L_gt = gt_ca.shape[0]
         L = min(L_pred, L_gt)
-        print(f"[warn] predicted length ({L_pred}) != ground-truth length ({L_gt}); using first {L} residues for RMSD.")
-        pred_use = pred_ca[:L]
-        gt_use = gt_ca[:L]
-    else:
-        pred_use = pred_ca
-        gt_use = gt_ca
+        gt_use  = gt_ca[:L]
+        pred_fw = pred_ca[:L]
+        pred_rv = pred_ca[:L][::-1].copy()   # reversed order (C→N)
 
-    # Align prediction onto ground truth (Kabsch)
-    R, t = kabsch(gt_use, pred_use)
-    pred_aligned = (R @ pred_use.T).T + t
-    val = rmsd(gt_use, pred_aligned)
+        # forward
+        R, t = kabsch(gt_use, pred_fw)
+        pred_aligned_fw = (R @ pred_fw.T).T + t
+        val_fw = rmsd(gt_use, pred_aligned_fw)
+        if val_fw < best["val"]:
+            best.update(val=val_fw, chain=ch, reversed=False, pred_aligned=pred_aligned_fw, gt_used=gt_use)
 
-    # Save aligned predicted CA for inspection
+        # reversed
+        R, t = kabsch(gt_use, pred_rv)
+        pred_aligned_rv = (R @ pred_rv.T).T + t
+        val_rv = rmsd(gt_use, pred_aligned_rv)
+        if val_rv < best["val"]:
+            best.update(val=val_rv, chain=ch, reversed=True, pred_aligned=pred_aligned_rv, gt_used=gt_use)
+
+    # Save best-aligned predicted CA for inspection
     out_dir = os.path.dirname(os.path.abspath(pred_path))
     out_pdb = os.path.join(out_dir, "pred_aligned_to_gt.pdb")
-    write_ca_pdb(out_pdb, pred_aligned, chain_id="A")
+    write_ca_pdb(out_pdb, best["pred_aligned"], chain_id=str(best["chain"] or "A"))
 
     # Report
-    print("=== RMSD (Cα-aligned) ===")
+    print("=== RMSD (Cα-aligned; best over chains and orientation) ===")
     print(f"pdb_id           : {pdb_id}")
     print(f"residue range    : {start}-{end}")
-    print(f"len(pred / gt)   : {pred_use.shape[0]} / {gt_use.shape[0]}")
-    print(f"RMSD (Å)         : {val:.4f}")
+    print(f"len(pred / gt)   : {best['pred_aligned'].shape[0]} / {best['gt_used'].shape[0]}")
+    print(f"Best chain       : {best['chain']}")
+    print(f"Orientation      : {'reversed' if best['reversed'] else 'forward'}")
+    print(f"RMSD (Å)         : {best['val']:.4f}")
     print(f"Aligned PDB      : {out_pdb}")
+
 
     # Keep console open if double-clicked (optional)
     if sys.stdout.isatty() is False:
