@@ -42,6 +42,67 @@ OUT_MIN_PDB  = os.path.join(SCRIPT_DIR, "allatom_refined.pdb")
 # Utilities
 # -------------------------------
 
+# --- add near your imports ---
+from importlib import resources
+import os
+
+def _resolve_ffxml_paths(prefer_gbn2: bool = True):
+    """
+    Return a tuple (protein_xml, implicit_xml_or_None).
+    Try to resolve absolute paths for files that may live inside openmmforcefields.
+    Fallback to vacuum (implicit_xml_or_None=None) if none found.
+    """
+    # 1) protein forcefield (ff14SB)
+    protein_xml = None
+    protein_candidates_rel = [
+        # common names in OpenMM 8.x
+        "amber14/protein.ff14SB.xml",
+        "amber/protein.ff14SB.xml",
+    ]
+    # also try from openmmforcefields package (path inside the wheel)
+    try:
+        base = resources.files("openmmforcefields") / "ffxml" / "amber"
+        for p in ["protein.ff14SB.xml", "ff14SB.xml"]:
+            cand = base / p
+            if cand.is_file():
+                protein_xml = str(cand)
+                break
+    except Exception:
+        pass
+    if protein_xml is None:
+        # fall back to relative names (if OpenMM can find them)
+        for name in protein_candidates_rel:
+            # do not check existence; ForceField will try to resolve
+            protein_xml = name
+            break
+
+    # 2) implicit solvent xml (prefer GBn2, else OBC2)
+    implicit_xml = None
+    if prefer_gbn2:
+        try:
+            cand = resources.files("openmmforcefields") / "ffxml" / "amber" / "implicit" / "gbn2.xml"
+            if cand.is_file():
+                implicit_xml = str(cand)
+        except Exception:
+            pass
+    if implicit_xml is None:
+        # try OBC2 inside openmmforcefields
+        try:
+            cand = resources.files("openmmforcefields") / "ffxml" / "amber" / "implicit" / "obc2.xml"
+            if cand.is_file():
+                implicit_xml = str(cand)
+        except Exception:
+            pass
+    if implicit_xml is None:
+        # as a last resort, give OpenMM a chance with built-in names
+        for name in ["amber14/implicit/gbn2.xml", "amber/implicit/gbn2.xml",
+                     "amber14/implicit/obc2.xml", "amber/implicit/obc2.xml"]:
+            # we can't know existence here; ForceField will try
+            implicit_xml = name
+            break
+
+    return protein_xml, implicit_xml
+
 def read_ca_from_pdb_lines(path: str) -> np.ndarray:
     """Read CA xyz (Å) from a PDB (keeps file order)."""
     if not os.path.isfile(path):
@@ -141,7 +202,17 @@ def minimize_with_soft_ca_restraints(
     Minimize with ff14SB + GBn2 implicit solvent and soft CA positional restraints.
     Returns positions in Å (N,3).
     """
-    ff = app.ForceField("amber14/protein.ff14SB.xml", "amber14/implicit/gbn2.xml")
+    # ff = app.ForceField("amber14/protein.ff14SB.xml", "amber14/implicit/gbn2.xml")
+
+    protein_xml, implicit_xml = _resolve_ffxml_paths(prefer_gbn2=True)
+    ff_files = [protein_xml] if protein_xml is not None else []
+
+    # Try to include implicit solvent file if it really exists on disk;
+    # otherwise we'll fall back to vacuum (NoCutoff).
+    if implicit_xml is not None and os.path.isfile(implicit_xml):
+        ff_files.append(implicit_xml)
+    ff = app.ForceField(*ff_files)
+
     modeller = app.Modeller(top, unit.Quantity(init_positions_A, unit.angstrom))
     # Hydrogens were already added by PDBFixer; still safe to call addHydrogens (no-op)
     modeller.addHydrogens(ff, pH=7.0)
