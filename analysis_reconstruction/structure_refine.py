@@ -77,6 +77,31 @@ class RefineConfig:
 # Helpers
 # -------------------------------
 
+def _aa1_to_aa3_list(seq: Optional[str], L: int) -> List[str]:
+    """Map 1-letter AA sequence to a list of 3-letter residue names of length L.
+    - If seq is None: use 'GLY' * L.
+    - If len(seq) != L: use min(L, len(seq)) and pad with 'GLY' if needed.
+    - Unknown letters map to 'GLY'.
+    """
+    aa1_to_aa3 = {
+        "A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE",
+        "G": "GLY", "H": "HIS", "I": "ILE", "K": "LYS", "L": "LEU",
+        "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN", "R": "ARG",
+        "S": "SER", "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR"
+    }
+    names: List[str] = []
+    if seq is None:
+        return ["GLY"] * L
+    s = "".join(str(seq).strip().upper().split())
+
+    for i in range(L):
+        if i < len(s):
+            names.append(aa1_to_aa3.get(s[i], "GLY"))
+        else:
+            names.append("GLY")
+    return names
+
+
 def ensure_outdir(path: str):
     os.makedirs(path, exist_ok=True)
 
@@ -140,10 +165,11 @@ def pairwise_rmsd_sum(X_list: List[np.ndarray]) -> np.ndarray:
 
 
 def write_pdb_ca(path: str, coords: np.ndarray, sequence: Optional[str] = None, chain_id: str = "A"):
-    """Write Cα-only PDB (ATOM records). seqres optional; residue names fallback to 'GLY'."""
+    """Write Cα-only PDB (ATOM records). If sequence is given (1-letter), use proper 3-letter residue names."""
+    L = coords.shape[0]
+    resnames = _aa1_to_aa3_list(sequence, L)
     with open(path, "w", encoding="utf-8") as f:
-        resn = "GLY"
-        for i, (x, y, z) in enumerate(coords, start=1):
+        for i, ((x, y, z), resn) in enumerate(zip(coords, resnames), start=1):
             f.write(
                 "ATOM  {serial:5d}  CA  {resn} {chain}{resi:4d}    "
                 "{x:8.3f}{y:8.3f}{z:8.3f}  1.00 20.00           C\n".format(
@@ -151,6 +177,7 @@ def write_pdb_ca(path: str, coords: np.ndarray, sequence: Optional[str] = None, 
                 )
             )
         f.write("END\n")
+
 
 
 def write_csv_ca(path: str, coords: np.ndarray):
