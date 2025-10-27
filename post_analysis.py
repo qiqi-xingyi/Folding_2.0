@@ -35,7 +35,7 @@ def main():
     input_path = "e_results/1m7y/energies.jsonl"  # path to your energy file
     refine_mode = "premium"                      # "fast", "standard", or "premium"
     subsample_max = 5
-    top_energy_pct = 0.3
+    top_energy_pct = 0.2
     geom_thresh = 5.5
     steric_ok = True
     target_ca_distance = 3.7
