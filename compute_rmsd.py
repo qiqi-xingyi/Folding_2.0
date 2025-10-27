@@ -26,7 +26,7 @@ import numpy as np
 
 
 # ====== DEFAULT PATHS (edit here if needed) ======
-PRED_PDB  = os.path.join("e_results", "1m7y", "refined_ca.pdb")
+PRED_PDB  = os.path.join("e_results", "1m7y", "allatom_refined.pdb")
 INDEX_TSV = os.path.join("dataset", "benchmark_info.txt")
 DATA_ROOT = os.path.join("dataset", "Pdbbind")
 
