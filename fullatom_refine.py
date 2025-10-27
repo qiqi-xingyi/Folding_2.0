@@ -22,7 +22,7 @@ from openmm import app
 # PeptideBuilder / Biopython
 from Bio.PDB import PDBIO
 import PeptideBuilder
-from Bio.PDB.Polypeptide import one_to_three
+
 
 # ----------------------
 # User config
@@ -47,6 +47,17 @@ SCHEDULE = [
 # ----------------------
 # Helpers
 # ----------------------
+def one_to_three(res1: str) -> str:
+    table = {
+        "A": "ALA", "C": "CYS", "D": "ASP", "E": "GLU", "F": "PHE",
+        "G": "GLY", "H": "HIS", "I": "ILE", "K": "LYS", "L": "LEU",
+        "M": "MET", "N": "ASN", "P": "PRO", "Q": "GLN", "R": "ARG",
+        "S": "SER", "T": "THR", "V": "VAL", "W": "TRP", "Y": "TYR",
+        "B": "ASX", "Z": "GLX", "X": "GLY", "J": "LEU", "U": "SEC",
+        "O": "PYL"
+    }
+    return table.get(res1.upper(), "GLY")
+
 _AA3_TO_AA1 = {
     "ALA":"A","CYS":"C","ASP":"D","GLU":"E","PHE":"F","GLY":"G","HIS":"H","ILE":"I",
     "LYS":"K","LEU":"L","MET":"M","ASN":"N","PRO":"P","GLN":"Q","ARG":"R","SER":"S",
