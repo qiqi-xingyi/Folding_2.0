@@ -141,7 +141,7 @@ def minimize_with_soft_ca_restraints(
     Minimize with ff14SB + GBn2 implicit solvent and soft CA positional restraints.
     Returns positions in Å (N,3).
     """
-    ff = app.ForceField("amber14/protein.ff14SB.xml")
+    ff = app.ForceField("amber14/protein.ff14SB.xml", "amber14/implicit/gbn2.xml")
     modeller = app.Modeller(top, unit.Quantity(init_positions_A, unit.angstrom))
     # Hydrogens were already added by PDBFixer; still safe to call addHydrogens (no-op)
     modeller.addHydrogens(ff, pH=7.0)
@@ -151,8 +151,6 @@ def minimize_with_soft_ca_restraints(
         nonbondedMethod=app.NoCutoff,
         constraints=app.HBonds,
         removeCMMotion=True,
-        implicitSolvent=app.GBn2,
-        implicitSolventSaltConc=0.1 * unit.molar,
     )
 
     # Soft restraints on CA
