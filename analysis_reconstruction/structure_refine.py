@@ -271,6 +271,13 @@ def _moving_average_1d(D: np.ndarray, win: int = 3) -> np.ndarray:
     return out
 
 
+def _per_residue_std(aligned_list: List[np.ndarray]) -> np.ndarray:
+    """Per-residue positional std (L,) after alignment."""
+    A = np.stack(aligned_list, axis=0)  # (M, L, 3)
+    std = A.std(axis=0)                  # (L,3)
+    return np.linalg.norm(std, axis=1)   # (L,)
+
+
 # -------------------------------
 # Main class
 # -------------------------------
@@ -418,8 +425,7 @@ class StructureRefiner:
             aligned.append(aligned_X)
         self.aligned_list = aligned
 
-        # true GPA iterations with (later) energy-weighted mean
-        # initial unweighted proto-mean
+        # true GPA iterations (unweighted mean orientation stabilization)
         mean0 = np.mean(np.stack(self.aligned_list, axis=0), axis=0)
         for _ in range(max(0, self.cfg.gpa_iters)):
             new_list = []
@@ -441,10 +447,8 @@ class StructureRefiner:
         """
         cfg = self.cfg
         M = len(self.sub_df)
-        # collect per-key energy arrays
         keys = [k for k in cfg.energy_weights.keys() if k in self.sub_df.columns]
         if not keys:
-            # fallback to 1/M uniform
             return np.full(M, 1.0 / M, dtype=float)
 
         E_mat = []
@@ -461,7 +465,6 @@ class StructureRefiner:
         alphas = np.asarray(alphas, dtype=float)  # (K,)
 
         score = (E_mat * alphas[None, :]).sum(axis=1)  # higher => worse
-        # temperature for softmax
         tau = 1.0
         score = np.clip(score, -50.0, 50.0)
         w = np.exp(-score / tau)
@@ -471,7 +474,7 @@ class StructureRefiner:
 
     def _continuous_mean(self, extra_iters: int = 0):
         """
-        Build a continuous mean by averaging unit directions and reconstructing
+        Build a continuous mean by averaging unit directions (robust, trimmed) and reconstructing
         with a fixed Cα step (default 3.8 Å) from the medoid start point.
         """
         cfg = self.cfg
@@ -481,40 +484,44 @@ class StructureRefiner:
         # robust, energy-aware sample weights
         W = self._robust_energy_weights()  # (M,)
 
-        # compute unit edge directions for each aligned sample
+        # compute unit edge directions for each aligned sample, light smoothing per sample
         dirs_list = []
         for X in self.aligned_list:
             D = unit_directions_from_coords(X)  # (L-1,3)
-            # light 1D smoothing on each sample's direction field
             D = _moving_average_1d(D, win=3)
-            # renormalize
             n = np.linalg.norm(D, axis=1, keepdims=True)
             n = np.maximum(n, 1e-12)
             D = D / n
             dirs_list.append(D)
         D_all = np.stack(dirs_list, axis=0)     # (M, L-1, 3)
 
-        # energy-weighted mean direction and re-normalize per edge
-        Dbar = (W[:, None, None] * D_all).sum(axis=0)  # (L-1,3)
-        norms = np.linalg.norm(Dbar, axis=1, keepdims=True)
-        norms = np.maximum(norms, 1e-12)
-        Dbar = Dbar / norms
+        # energy-weighted raw mean unit direction
+        Dbar_raw = (W[:, None, None] * D_all).sum(axis=0)  # (L-1,3)
+        nr = np.linalg.norm(Dbar_raw, axis=1, keepdims=True)
+        nr = np.maximum(nr, 1e-12)
+        Dbar_unit = Dbar_raw / nr  # (L-1,3)
 
-        # extra mild smoothing on the averaged direction field
+        # trimmed mean (discard 20% worst by angular deviation)
+        M, Lm1, _ = D_all.shape
+        keep_k = max(1, int(round(M * 0.8)))
+        Dbar = np.zeros_like(Dbar_unit)
+        for e in range(Lm1):
+            u = Dbar_unit[e]                       # (3,)
+            dots = (D_all[:, e, :] @ u)            # (M,)
+            idx = np.argsort(-dots)[:keep_k]       # top aligned
+            v = (W[idx, None] * D_all[idx, e, :]).sum(axis=0)
+            nv = np.linalg.norm(v) + 1e-12
+            Dbar[e] = v / nv
+
+        # light smoothing + renormalize
         Dbar = _moving_average_1d(Dbar, win=3)
         norms = np.linalg.norm(Dbar, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-12)
         Dbar = Dbar / norms
 
         step = float(cfg.target_ca_distance or 3.8)
-        # use medoid's first CA as the start to minimize global drift
-        if self.medoid_idx_in_sub is not None:
-            P0 = self.aligned_list[self.medoid_idx_in_sub][0]
-        else:
-            P0 = np.zeros(3, dtype=float)
-
-        mean = reconstruct_by_dirs(P0, Dbar, step)  # (L,3)
-        self.mean_ca = mean
+        P0 = self.aligned_list[self.medoid_idx_in_sub][0] if self.medoid_idx_in_sub is not None else np.zeros(3)
+        self.mean_ca = reconstruct_by_dirs(P0, Dbar, step)  # (L,3)
 
     def _project_geometry(self):
         """
@@ -523,7 +530,8 @@ class StructureRefiner:
           (2) neighbor distance enforcement
           (3) non-neighbor repulsion
           (4) immediate arc-length reconstruction to lock all Cα-Cα distances
-        and finally a post-pass to resolve residual close contacts.
+        and finally a post-pass to resolve residual close contacts;
+        then a variance-guided shrink toward medoid on high-uncertainty residues.
         """
         cfg = self.cfg
         assert self.mean_ca is not None
@@ -532,10 +540,10 @@ class StructureRefiner:
         d0 = float(cfg.target_ca_distance or 3.8)
 
         for _ in range(cfg.proj_iters):
-            # 1) light smoothing (avoid too large shrink)
+            # 1) light smoothing (avoid excessive shrink)
             X = laplacian_smooth(X, cfg.proj_smooth_strength)
 
-            # 2) enforce neighbor distance to target
+            # 2) enforce neighbor distance
             if cfg.proj_enforce_bond:
                 X = enforce_neighbor_distance(X, target=d0, iters=10)
 
@@ -562,7 +570,18 @@ class StructureRefiner:
             D = unit_directions_from_coords(X_fixed)
             X_fixed = reconstruct_by_dirs(X_fixed[0], D, d0)
 
-        self.projected_ca = X_fixed
+        # variance-guided shrink toward medoid on uncertain residues, then lock step
+        if self.aligned_list is not None and self.medoid_idx_in_sub is not None:
+            var_s = _per_residue_std(self.aligned_list)     # (L,)
+            m = np.median(var_s) + 1e-12
+            w = np.clip((var_s / (2.5 * m)) - 0.2, 0.0, 0.5)  # per-residue blend weight in [0,0.5]
+            med = self.aligned_list[self.medoid_idx_in_sub]
+            X_blend = (1.0 - w[:, None]) * X_fixed + w[:, None] * med
+            D = unit_directions_from_coords(X_blend)
+            X_fixed2 = reconstruct_by_dirs(X_blend[0], D, d0)
+            self.projected_ca = X_fixed2
+        else:
+            self.projected_ca = X_fixed
 
     def _local_energy_polish(self):
         cfg = self.cfg
