@@ -44,12 +44,12 @@ class ClusterConfig:
     strict_same_length: bool = True
 
     # ---- EGDC: energy-geometry diffusion clustering ----
-    distance_model: str = "geom_diffusion"  # "geom_diffusion" | "hamming" (fallback)
+    distance_model: str = "geom_diffusion"  # "geom_diffusion" | "hamming"
     # geometric kernel (RMSD -> Gaussian kernel), with kNN sparsification
-    geom_kernel_eps: float = 0.5            # scale for RMSD Gaussian kernel
+    geom_kernel_eps: float = 0.5            # if <=0, use auto-estimated median RMSD
     knn: int = 40                           # keep top-k neighbors per row (symmetrized)
     # energy weighting to form a reversible kernel (detailed balance)
-    temperature_kT: float = 0.5             # effective temperature
+    temperature_kT: float = 0.5             # if <=0, auto from IQR(E_scaled)
 
     # diffusion map embedding
     diffusion_time: int = 3                 # diffusion time t
@@ -79,6 +79,9 @@ class ClusterConfig:
     energy_rescale_high_q: float = 0.99
     energy_rescale_target: float = 10.0     # map [q_low, q_high] -> [0, target]
     energy_scaled_key: str = "E_total_scaled"
+
+    # ---- NEW: encourage energy-smooth clusters in k selection ----
+    energy_smooth_mu: float = 0.0           # set >0 to reward lower within-cluster energy variance
 
     def normalize(self):
         self.method = str(self.method).lower().strip()
@@ -129,7 +132,6 @@ def read_table(path: str) -> pd.DataFrame:
 
 
 def parse_prefilter(df: pd.DataFrame, rules: Dict[str, Any]) -> pd.Series:
-    """Apply simple prefilter rules. e.g., {"E_steric<=0": true, "E_geom<=7.5": true}"""
     if not rules:
         return pd.Series(True, index=df.index)
     mask = pd.Series(True, index=df.index)
@@ -162,7 +164,6 @@ def parse_prefilter(df: pd.DataFrame, rules: Dict[str, Any]) -> pd.Series:
 
 
 def extract_main_vectors(df: pd.DataFrame, col: str) -> Tuple[np.ndarray, List[int]]:
-    """Return (matrix[N,L], valid_indices). Values must be iterable of ints or JSON-encoded lists."""
     valid_idx: List[int] = []
     vectors: List[List[int]] = []
     for i, v in enumerate(df[col].tolist()):
@@ -197,7 +198,6 @@ def extract_main_vectors(df: pd.DataFrame, col: str) -> Tuple[np.ndarray, List[i
 
 
 def extract_positions(df: pd.DataFrame, col: str) -> Tuple[np.ndarray, List[int]]:
-    """Return (tensor[N,L,3], valid_indices). Values must be iterable (Lx3) or JSON."""
     valid_idx: List[int] = []
     pos_list: List[np.ndarray] = []
     for i, v in enumerate(df[col].tolist()):
@@ -212,7 +212,7 @@ def extract_positions(df: pd.DataFrame, col: str) -> Tuple[np.ndarray, List[int]
         if not isinstance(v, (list, tuple)):
             continue
         try:
-            arr = np.array(v, dtype=float)  # shape (L, 3) or (L+1, 3)
+            arr = np.array(v, dtype=float)
             if arr.ndim != 2 or arr.shape[1] != 3:
                 continue
         except Exception:
@@ -226,32 +226,11 @@ def extract_positions(df: pd.DataFrame, col: str) -> Tuple[np.ndarray, List[int]
         logging.warning("positions have varying lengths: %s", sorted(lengths))
         L = min(lengths)
         pos_list = [p[:L] for p in pos_list]
-    pos = np.stack(pos_list, axis=0)  # (N, L, 3)
+    pos = np.stack(pos_list, axis=0)
     return pos, valid_idx
 
 
-def _has_overlap_single(P: np.ndarray, eps: float = 1e-8) -> bool:
-    N = P.shape[0]
-    if N < 3:
-        return False
-
-    for i in range(N):
-        for j in range(i+2, N):
-            if np.linalg.norm(P[i]-P[j]) < eps:
-                return True
-    return False
-
-def _filter_overlap_positions(pos_all: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-
-    M = pos_all.shape[0]
-    keep = np.ones(M, dtype=bool)
-    for m in range(M):
-        if _has_overlap_single(pos_all[m], eps=eps):
-            keep[m] = False
-    return keep
-
 def hamming_distance_matrix(mat: np.ndarray) -> np.ndarray:
-    """Pairwise normalized Hamming distance for integer-coded sequences."""
     n, L = mat.shape
     dm = np.zeros((n, n), dtype=np.float32)
     for i in range(n):
@@ -267,9 +246,6 @@ def hamming_distance_matrix(mat: np.ndarray) -> np.ndarray:
 # -------------------------------
 
 def _kabsch_rmsd(A: np.ndarray, B: np.ndarray) -> float:
-    """RMSD between two point sets after optimal superposition (Kabsch).
-    A, B: (L,3)
-    """
     Ac = A - A.mean(axis=0, keepdims=True)
     Bc = B - B.mean(axis=0, keepdims=True)
     H = Ac.T @ Bc
@@ -284,7 +260,6 @@ def _kabsch_rmsd(A: np.ndarray, B: np.ndarray) -> float:
 
 
 def rmsd_distance_matrix(pos: np.ndarray) -> np.ndarray:
-    """Pairwise RMSD (Kabsch) for (N,L,3)."""
     N = pos.shape[0]
     dm = np.zeros((N, N), dtype=np.float32)
     for i in range(N):
@@ -296,7 +271,6 @@ def rmsd_distance_matrix(pos: np.ndarray) -> np.ndarray:
 
 
 def energy_diff_matrix(E: np.ndarray, method: str = "rank") -> np.ndarray:
-    """Energy difference 'distance' in [0,1]."""
     N = len(E)
     if N <= 1:
         return np.zeros((N, N), dtype=np.float32)
@@ -312,7 +286,6 @@ def energy_diff_matrix(E: np.ndarray, method: str = "rank") -> np.ndarray:
 
 
 def combine_distance(dm_base: np.ndarray, E: np.ndarray, alpha: float = 0.8, method: str = "rank") -> np.ndarray:
-    """d = alpha * base + (1 - alpha) * EnergyDiff."""
     dm_E = energy_diff_matrix(E, method=method)
     return alpha * dm_base + (1.0 - alpha) * dm_E
 
@@ -326,12 +299,6 @@ def build_energy_geometry_kernel(dm_geom: np.ndarray,
                                  eps: float,
                                  kT: float,
                                  knn: int) -> np.ndarray:
-    """
-    Reversible kernel K (satisfies detailed balance):
-      base_ij = exp(-(d_ij^2) / eps^2) from geometry (RMSD);
-      K_ij = base_ij * sqrt(pi_j / pi_i), where pi_i ∝ exp(-E_i/kT).
-    The kernel is sparsified by symmetric kNN.
-    """
     N = dm_geom.shape[0]
     base = np.exp(- (dm_geom ** 2) / max(1e-12, eps ** 2))
     np.fill_diagonal(base, 0.0)
@@ -353,17 +320,11 @@ def build_energy_geometry_kernel(dm_geom: np.ndarray,
 
 
 def diffusion_map_embedding_from_kernel(K: np.ndarray, t: int, m: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Symmetric normalization: S = D^{-1/2} K D^{-1/2}.
-    Eigendecompose S; take top m non-trivial eigenvectors (skip the first trivial mode).
-    Embedding: Psi_k = (lambda_k)^t * u_k.
-    Returns (embedding[N,m], lambdas[m]).
-    """
     d = np.asarray(K.sum(axis=1)).reshape(-1)
     d[d <= 1e-30] = 1e-30
     inv_sqrt_d = 1.0 / np.sqrt(d)
     S = (inv_sqrt_d[:, None] * K) * inv_sqrt_d[None, :]
-    vals, vecs = np.linalg.eigh(S)  # ascending
+    vals, vecs = np.linalg.eigh(S)
     idx = np.argsort(vals)[::-1]
     vals = vals[idx]
     vecs = vecs[:, idx]
@@ -375,7 +336,6 @@ def diffusion_map_embedding_from_kernel(K: np.ndarray, t: int, m: int) -> Tuple[
 
 
 def pairwise_euclidean_distance(X: np.ndarray) -> np.ndarray:
-    """Pairwise Euclidean distances for X[N,d]."""
     N = X.shape[0]
     G = X @ X.T
     nrm = np.sum(X * X, axis=1, keepdims=True)
@@ -385,11 +345,34 @@ def pairwise_euclidean_distance(X: np.ndarray) -> np.ndarray:
 
 
 # -------------------------------
+# Overlap filters (NEW)
+# -------------------------------
+
+def _has_overlap_single(P: np.ndarray, eps: float = 1e-8) -> bool:
+    N = P.shape[0]
+    if N < 3:
+        return False
+    for i in range(N):
+        for j in range(i + 2, N):
+            if np.linalg.norm(P[i] - P[j]) < eps:
+                return True
+    return False
+
+
+def _filter_overlap_positions(pos_all: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    M = pos_all.shape[0]
+    keep = np.ones(M, dtype=bool)
+    for m in range(M):
+        if _has_overlap_single(pos_all[m], eps=eps):
+            keep[m] = False
+    return keep
+
+
+# -------------------------------
 # Classic helpers (kept)
 # -------------------------------
 
 def cluster_with_hdbscan(dm: np.ndarray, min_cluster_size: int) -> np.ndarray:
-    """Run HDBSCAN clustering on a precomputed distance matrix."""
     if not _HDBSCAN_AVAILABLE:
         raise RuntimeError("hdbscan is not available.")
     clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, metric="precomputed")
@@ -398,7 +381,6 @@ def cluster_with_hdbscan(dm: np.ndarray, min_cluster_size: int) -> np.ndarray:
 
 
 def silhouette_score_from_distance(dm: np.ndarray, labels: np.ndarray) -> float:
-    """Silhouette from a precomputed distance matrix. Returns -1 if invalid."""
     n = dm.shape[0]
     if n != len(labels):
         return -1.0
@@ -434,7 +416,6 @@ def silhouette_score_from_distance(dm: np.ndarray, labels: np.ndarray) -> float:
 
 
 def collapse_identical_vectors(mat: np.ndarray, idx: List[int]) -> Tuple[np.ndarray, List[List[int]], np.ndarray]:
-    """Collapse identical rows. Return unique-matrix, groups (original df indices), and frequency weights."""
     from collections import defaultdict
     keys = [tuple(row.tolist()) for row in mat]
     bucket: Dict[Tuple[int, ...], List[int]] = defaultdict(list)
@@ -449,7 +430,6 @@ def collapse_identical_vectors(mat: np.ndarray, idx: List[int]) -> Tuple[np.ndar
 
 
 def energy_to_weights(E: np.ndarray, beta: float = 2.0) -> np.ndarray:
-    """Map energy to clustering weights: lower energy -> larger weight."""
     N = len(E)
     ranks = E.argsort().argsort().astype(np.float64)
     r = ranks / max(1, N - 1)
@@ -460,7 +440,6 @@ def energy_to_weights(E: np.ndarray, beta: float = 2.0) -> np.ndarray:
 
 
 def weighted_silhouette_from_distance(dm: np.ndarray, labels: np.ndarray, weights: np.ndarray) -> float:
-    """Weighted silhouette on a precomputed distance matrix."""
     M = dm.shape[0]
     uniq = [c for c in np.unique(labels) if c != -1]
     if len(uniq) < 2:
@@ -493,7 +472,6 @@ def weighted_silhouette_from_distance(dm: np.ndarray, labels: np.ndarray, weight
 
 
 def pam_kmedoids(dm: np.ndarray, k: int, rng: np.random.RandomState, max_iter: int = 200) -> Tuple[np.ndarray, np.ndarray]:
-    """PAM (k-medoids) using a precomputed distance matrix. Returns (labels, medoid_indices)."""
     n = dm.shape[0]
     if k <= 1:
         return np.zeros(n, dtype=int), np.array([int(np.argmin(dm.sum(axis=1)))])
@@ -544,7 +522,6 @@ def pam_kmedoids_weighted(dm: np.ndarray,
                           rng: np.random.RandomState,
                           weights: Optional[np.ndarray] = None,
                           max_iter: int = 200) -> Tuple[np.ndarray, np.ndarray]:
-    """Weighted PAM (precomputed distance). weights >= 0."""
     n = dm.shape[0]
     if weights is None:
         weights = np.ones(n, dtype=np.float64)
@@ -606,16 +583,32 @@ def pam_kmedoids_weighted(dm: np.ndarray,
     return labels, medoids
 
 
+def _weighted_variance(x: np.ndarray, w: np.ndarray) -> float:
+    w = np.clip(np.asarray(w, dtype=float), 1e-12, None)
+    x = np.asarray(x, dtype=float)
+    mu = np.sum(w * x) / np.sum(w)
+    var = np.sum(w * (x - mu) ** 2) / np.sum(w)
+    return float(var)
+
+
 def pick_k_balanced(dm: np.ndarray, rng: np.random.RandomState, k_candidates: Sequence[int],
                     weights: np.ndarray, max_cluster_frac: float, silhouette_floor: float,
-                    penalty_lambda: float) -> Tuple[int, Dict[int, Dict[str, float]]]:
+                    penalty_lambda: float, energy: Optional[np.ndarray] = None,
+                    energy_smooth_mu: float = 0.0) -> Tuple[int, Dict[int, Dict[str, float]]]:
     """
-    Return best_k and diagnostics per k: {"sil":..., "max_frac":..., "score":...}
-    score = sil - penalty_lambda * max_frac; require sil >= silhouette_floor
+    Return best_k and diagnostics per k: {"sil":..., "max_frac":..., "score":..., "wvar":...}
+    score = sil - penalty_lambda * max_frac - energy_smooth_mu * mean_within_var_norm
     """
     M = dm.shape[0]
     report: Dict[int, Dict[str, float]] = {}
     best_k, best_score = None, -1e9
+
+    glob_var = None
+    if energy is not None and len(energy) == M:
+        ew = np.clip(np.asarray(weights, dtype=float), 1e-12, None)
+        glob_var = _weighted_variance(np.asarray(energy, dtype=float), ew)
+        if glob_var <= 1e-18:
+            glob_var = None
 
     for k in k_candidates:
         labels_u, _ = pam_kmedoids(dm, k, rng)
@@ -627,8 +620,22 @@ def pick_k_balanced(dm: np.ndarray, rng: np.random.RandomState, k_candidates: Se
             frac = max(frac, w / weights.sum())
 
         sil = weighted_silhouette_from_distance(dm, labels_u, weights)
-        score = (sil if sil >= silhouette_floor else -1e9) - penalty_lambda * frac
-        report[k] = {"sil": float(sil), "max_frac": float(frac), "score": float(score)}
+
+        wvar_norm_mean = 0.0
+        if glob_var is not None and energy is not None:
+            vals = []
+            for c in np.unique(labels_u):
+                if c == -1:
+                    continue
+                idx = np.where(labels_u == c)[0]
+                if len(idx) >= 2:
+                    v = _weighted_variance(energy[idx], weights[idx]) / glob_var
+                    vals.append(v)
+            if len(vals) > 0:
+                wvar_norm_mean = float(np.mean(vals))
+
+        score = (sil if sil >= silhouette_floor else -1e9) - penalty_lambda * frac - float(energy_smooth_mu) * wvar_norm_mean
+        report[k] = {"sil": float(sil), "max_frac": float(frac), "score": float(score), "wvar_norm_mean": float(wvar_norm_mean)}
         if score > best_score:
             best_score = score
             best_k = k
@@ -690,13 +697,11 @@ class ClusterAnalyzer:
     # ---- data I/O ----
 
     def load_dataframe(self, df: pd.DataFrame):
-        """Set input DataFrame."""
         if self.cfg.id_col and self.cfg.id_col in df.columns:
             df = df.set_index(self.cfg.id_col, drop=False)
         self.df_raw = df
 
     def load_file(self, path: str):
-        """Helper to read a table file and set as input."""
         df = read_table(path)
         self.load_dataframe(df)
 
@@ -752,7 +757,6 @@ class ClusterAnalyzer:
         ql = float(np.quantile(e, self.cfg.energy_rescale_low_q))
         qh = float(np.quantile(e, self.cfg.energy_rescale_high_q))
         if not np.isfinite(ql) or not np.isfinite(qh) or qh <= ql + 1e-12:
-            # degenerate; fall back to identity
             self.df_[self.cfg.energy_scaled_key] = e.values
             self._energy_scale_info = {
                 "mode": "degenerate",
@@ -797,6 +801,21 @@ class ClusterAnalyzer:
             self.vec_mat = self.vec_mat[keep_mask]
             self.valid_idx = list(idx_valid[keep_mask])
 
+        # ---- Filter overlap structures early (NEW) ----
+        pos_all, valid_idx_pos = extract_positions(self.df_, self.cfg.positions_col)
+        mapper_all = {orig_i: k for k, orig_i in enumerate(valid_idx_pos)}
+        rows_all = [mapper_all[i] for i in self.valid_idx if i in mapper_all]
+        if len(rows_all) != len(self.valid_idx):
+            raise RuntimeError("Positions index mismatch before overlap filtering.")
+        POS_for_vec = pos_all[rows_all]
+        mask_keep = _filter_overlap_positions(POS_for_vec, eps=1e-8)
+        if not np.all(mask_keep):
+            self.vec_mat = self.vec_mat[mask_keep]
+            self.valid_idx = list(np.array(self.valid_idx)[mask_keep])
+            POS_for_vec = POS_for_vec[mask_keep]
+            if len(self.valid_idx) == 0:
+                raise RuntimeError("All rows filtered out by overlap check.")
+
         # NEW: batch rescale energy to a fixed range for kernel/weights
         self._rescale_energy_batch()
         ekey_used = self.cfg.energy_scaled_key  # this column is used for kernel/weights
@@ -805,32 +824,89 @@ class ClusterAnalyzer:
         if self.cfg.collapse_identical:
             mat_u, groups, freq_w = collapse_identical_vectors(self.vec_mat, self.valid_idx)
 
-            # median energy per unique group (scaled)
             if ekey_used not in self.df_.columns:
                 raise ValueError(f"Energy key {ekey_used} not found in data.")
             colE_scaled = self.df_[ekey_used].astype(float)
             E_u = np.array([float(np.median(colE_scaled.iloc[grp].values)) for grp in groups], dtype=np.float64)
 
-            # pick representative positions per unique vector: choose median-energy member (based on scaled energy)
+            # pick representative positions per unique vector: geometric medoid (NEW)
             rep_indices = []
+            pos_all2, valid_idx_pos2 = extract_positions(self.df_, self.cfg.positions_col)
+            mapper2 = {orig_i: k for k, orig_i in enumerate(valid_idx_pos2)}
             for grp in groups:
-                es = colE_scaled.iloc[grp].values.astype(float)
-                mid_rank = np.argsort(es)[len(es)//2]
-                rep_indices.append(grp[mid_rank])
+                rows = [mapper2[i] for i in grp if i in mapper2]
+                if len(rows) == 0:
+                    raise RuntimeError("Positions/indices mismatch when selecting representatives.")
+                P = pos_all2[rows]
+                dm_in = rmsd_distance_matrix(P)
+                med_local = int(np.argmin(dm_in.sum(axis=1)))
+                rep_indices.append(grp[med_local])
 
-            pos_all, valid_idx_pos = extract_positions(self.df_, self.cfg.positions_col)
-            mapper = {orig_i: k for k, orig_i in enumerate(valid_idx_pos)}
-            rep_rows = [mapper[i] for i in rep_indices if i in mapper]
+            pos_all3, valid_idx_pos3 = extract_positions(self.df_, self.cfg.positions_col)
+            mapper3 = {orig_i: k for k, orig_i in enumerate(valid_idx_pos3)}
+            rep_rows = [mapper3[i] for i in rep_indices if i in mapper3]
             if len(rep_rows) != len(rep_indices):
                 raise RuntimeError("Positions/indices mismatch when selecting representatives.")
-            POS_u = pos_all[rep_rows]  # (M,L,3)
+            POS_u = pos_all3[rep_rows]  # (M,L,3)
 
             if self.cfg.distance_model == "geom_diffusion":
                 dm_geom = rmsd_distance_matrix(POS_u)
+
+                # adaptive eps (NEW)
+                eps_cfg = float(self.cfg.geom_kernel_eps)
+                vals = dm_geom[np.triu_indices_from(dm_geom, k=1)]
+                med_val = np.median(vals) if vals.size > 0 else 0.0
+                eps_auto = med_val if (np.isfinite(med_val) and med_val > 0) else np.percentile(vals, 60) if vals.size > 0 else 1.0
+                eps_use = eps_auto if (not np.isfinite(eps_cfg) or eps_cfg <= 0) else eps_cfg
+
+                # adaptive kT (NEW)
+                def _robust_kT(arr: np.ndarray, floor: float = 0.5, ceil: float = 5.0) -> float:
+                    arr = np.asarray(arr, dtype=float)
+                    if arr.size < 2:
+                        return 1.0
+                    q1, q3 = np.percentile(arr, [25, 75])
+                    iqr = max(1e-9, q3 - q1)
+                    kt = np.clip(iqr, floor, ceil)
+                    return float(kt)
+
+                kt_use = float(self.cfg.temperature_kT) if (self.cfg.temperature_kT is not None and self.cfg.temperature_kT > 0) else _robust_kT(E_u, floor=0.5, ceil=5.0)
+
                 K = build_energy_geometry_kernel(dm_geom, E_u,
-                                                 eps=self.cfg.geom_kernel_eps,
-                                                 kT=self.cfg.temperature_kT,
+                                                 eps=eps_use,
+                                                 kT=kt_use,
                                                  knn=self.cfg.knn)
+
+                # connectivity keep largest component (NEW)
+                G = (K > 0).astype(np.uint8)
+                N = G.shape[0]
+                visited = np.zeros(N, dtype=bool)
+                components = []
+                for i in range(N):
+                    if visited[i]:
+                        continue
+                    stack = [i]
+                    comp = []
+                    visited[i] = True
+                    while stack:
+                        u = stack.pop()
+                        comp.append(u)
+                        nbrs = np.where(G[u] != 0)[0]
+                        for v in nbrs:
+                            if not visited[v]:
+                                visited[v] = True
+                                stack.append(v)
+                    components.append(comp)
+                if len(components) > 1:
+                    components.sort(key=len, reverse=True)
+                    keep_idx = np.array(sorted(components[0]), dtype=int)
+                    K = K[keep_idx][:, keep_idx]
+                    dm_geom = dm_geom[keep_idx][:, keep_idx]
+                    POS_u = POS_u[keep_idx]
+                    E_u = E_u[keep_idx]
+                    mat_u = mat_u[keep_idx]
+                    freq_w = freq_w[keep_idx]
+                    groups = [groups[i] for i in keep_idx.tolist()]
+
                 emb, lambdas = diffusion_map_embedding_from_kernel(
                     K, t=int(self.cfg.diffusion_time), m=int(self.cfg.embedding_dim)
                 )
@@ -856,7 +932,9 @@ class ClusterAnalyzer:
                     weights=w_cluster,
                     max_cluster_frac=self.cfg.max_cluster_frac,
                     silhouette_floor=self.cfg.silhouette_floor,
-                    penalty_lambda=self.cfg.penalty_lambda
+                    penalty_lambda=self.cfg.penalty_lambda,
+                    energy=E_u,
+                    energy_smooth_mu=self.cfg.energy_smooth_mu
                 )
                 labels_u, _ = pam_kmedoids_weighted(dm_u, best_k, self.rng, weights=w_cluster)
             else:
@@ -865,7 +943,9 @@ class ClusterAnalyzer:
                     weights=freq_w,
                     max_cluster_frac=self.cfg.max_cluster_frac,
                     silhouette_floor=self.cfg.silhouette_floor,
-                    penalty_lambda=self.cfg.penalty_lambda
+                    penalty_lambda=self.cfg.penalty_lambda,
+                    energy=E_u,
+                    energy_smooth_mu=self.cfg.energy_smooth_mu
                 )
                 labels_u, _ = pam_kmedoids(dm_u, best_k, self.rng)
 
@@ -884,21 +964,71 @@ class ClusterAnalyzer:
                 self.dm_ = dm_u.astype(np.float32)
 
         else:
-            # sample-level path (not recommended for highly duplicated data)
+            # sample-level path
             if self.cfg.distance_model == "geom_diffusion":
-                pos_all, valid_idx_pos = extract_positions(self.df_, self.cfg.positions_col)
-                mapper = {orig_i: k for k, orig_i in enumerate(valid_idx_pos)}
-                rows = [mapper[i] for i in self.valid_idx if i in mapper]
+                pos_all_s, valid_idx_pos_s = extract_positions(self.df_, self.cfg.positions_col)
+                mapper_s = {orig_i: k for k, orig_i in enumerate(valid_idx_pos_s)}
+                rows = [mapper_s[i] for i in self.valid_idx if i in mapper_s]
                 if len(rows) != len(self.valid_idx):
                     raise RuntimeError("Positions index mismatch on sample-level path.")
-                POS = pos_all[rows]
+                POS = pos_all_s[rows]
                 E = self.df_.iloc[self.valid_idx][ekey_used].astype(float).values
 
                 dm_geom = rmsd_distance_matrix(POS)
+
+                # adaptive eps (NEW)
+                eps_cfg = float(self.cfg.geom_kernel_eps)
+                vals = dm_geom[np.triu_indices_from(dm_geom, k=1)]
+                med_val = np.median(vals) if vals.size > 0 else 0.0
+                eps_auto = med_val if (np.isfinite(med_val) and med_val > 0) else np.percentile(vals, 60) if vals.size > 0 else 1.0
+                eps_use = eps_auto if (not np.isfinite(eps_cfg) or eps_cfg <= 0) else eps_cfg
+
+                # adaptive kT (NEW)
+                def _robust_kT(arr: np.ndarray, floor: float = 0.5, ceil: float = 5.0) -> float:
+                    arr = np.asarray(arr, dtype=float)
+                    if arr.size < 2:
+                        return 1.0
+                    q1, q3 = np.percentile(arr, [25, 75])
+                    iqr = max(1e-9, q3 - q1)
+                    kt = np.clip(iqr, floor, ceil)
+                    return float(kt)
+
+                kt_use = float(self.cfg.temperature_kT) if (self.cfg.temperature_kT is not None and self.cfg.temperature_kT > 0) else _robust_kT(E, floor=0.5, ceil=5.0)
+
                 K = build_energy_geometry_kernel(dm_geom, E,
-                                                 eps=self.cfg.geom_kernel_eps,
-                                                 kT=self.cfg.temperature_kT,
+                                                 eps=eps_use,
+                                                 kT=kt_use,
                                                  knn=self.cfg.knn)
+                # connectivity (NEW)
+                G = (K > 0).astype(np.uint8)
+                N = G.shape[0]
+                visited = np.zeros(N, dtype=bool)
+                components = []
+                for i in range(N):
+                    if visited[i]:
+                        continue
+                    stack = [i]
+                    comp = []
+                    visited[i] = True
+                    while stack:
+                        u = stack.pop()
+                        comp.append(u)
+                        nbrs = np.where(G[u] != 0)[0]
+                        for v in nbrs:
+                            if not visited[v]:
+                                visited[v] = True
+                                stack.append(v)
+                    components.append(comp)
+                if len(components) > 1:
+                    components.sort(key=len, reverse=True)
+                    keep_idx = np.array(sorted(components[0]), dtype=int)
+                    K = K[keep_idx][:, keep_idx]
+                    dm_geom = dm_geom[keep_idx][:, keep_idx]
+                    POS = POS[keep_idx]
+                    E = E[keep_idx]
+                    idx_valid = np.array(self.valid_idx)[keep_idx]
+                    self.valid_idx = list(idx_valid)
+
                 emb, lambdas = diffusion_map_embedding_from_kernel(
                     K, t=int(self.cfg.diffusion_time), m=int(self.cfg.embedding_dim)
                 )
@@ -920,7 +1050,11 @@ class ClusterAnalyzer:
                 self.labels_ = np.zeros(n, dtype=int)
             else:
                 if self.cfg.method == "hdbscan" and _HDBSCAN_AVAILABLE:
-                    min_cs = self.cfg.min_cluster_size or max(5, int(math.sqrt(n)))
+                    # adaptive min_cluster_size (NEW)
+                    min_cs = self.cfg.min_cluster_size
+                    if min_cs is None or min_cs <= 0:
+                        min_cs = max(20, int(0.01 * n))
+                    min_cs = min(min_cs, max(5, n // 3))
                     self.labels_ = cluster_with_hdbscan(dm, min_cs)
                 else:
                     if self.cfg.use_weighted_pam:
@@ -928,7 +1062,9 @@ class ClusterAnalyzer:
                         best_k, _ = pick_k_balanced(dm, self.rng, self.cfg.k_candidates, weights=w,
                                                     max_cluster_frac=self.cfg.max_cluster_frac,
                                                     silhouette_floor=self.cfg.silhouette_floor,
-                                                    penalty_lambda=self.cfg.penalty_lambda)
+                                                    penalty_lambda=self.cfg.penalty_lambda,
+                                                    energy=E,
+                                                    energy_smooth_mu=self.cfg.energy_smooth_mu)
                         labels, _ = pam_kmedoids_weighted(dm, best_k, self.rng, weights=w)
                     else:
                         best_k = None
@@ -948,7 +1084,6 @@ class ClusterAnalyzer:
         working_df = self.df_.iloc[self.valid_idx].copy()
         if ekey_used not in working_df.columns:
             raise ValueError(f"Energy key {ekey_used} not found in data.")
-        # use scaled energy for stats and best cluster choice
         stats = compute_cluster_energy_stats(working_df, self.labels_, ekey_used)
         self.stats_ = stats
         best_cid = choose_best_cluster(stats)
@@ -972,7 +1107,6 @@ class ClusterAnalyzer:
         return self.stats_
 
     def save_reports(self):
-        """Persist clusters.csv, cluster_stats.json, best_cluster_ids.txt to cfg.output_dir."""
         if self.df_ is None or self.vec_mat is None or self.labels_ is None:
             raise RuntimeError("Run fit() before saving.")
 
