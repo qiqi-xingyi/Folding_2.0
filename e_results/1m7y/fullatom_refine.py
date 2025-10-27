@@ -27,8 +27,11 @@ import PeptideBuilder
 # ----------------------
 # User config
 # ----------------------
-REFINED_CA_PDB = "refined_ca.pdb"     # your Cα-only PDB (from StructureRefiner.save_outputs)
-OUT_PDB = "allatom_refined.pdb"        # final output
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REFINED_CA_PDB = os.path.join(SCRIPT_DIR, "refined_ca.pdb")
+OUT_PDB = os.path.join(SCRIPT_DIR, "allatom_refined.pdb")
+
 PLATFORM = "CPU"                       # "CUDA" | "OpenCL" | "CPU"
 TEMPERATURE = 300.0 * unit.kelvin
 FRICTION = 1.0 / unit.picosecond
@@ -185,16 +188,18 @@ def main():
     pdb_init = build_peptide_pdb_from_sequence(seq)
 
     # 3) Force field and Modeller
-    ff = app.ForceField("amber14/protein.ff14SB.xml", "amber14/implicit/gbn2.xml")
+    ff = app.ForceField("amber14/protein.ff14SB.xml")
     modeller = app.Modeller(pdb_init.topology, pdb_init.positions)
-    app.Modeller.addHydrogens(modeller, forcefield=ff, pH=7.0)
+    modeller.addHydrogens(ff, pH=7.0)
 
     # 4) Create system
     system = ff.createSystem(
         modeller.topology,
-        nonbondedMethod=app.NoCutoff,
+        nonbondedMethod=app.NoCutoff,  # implicit solvent normally uses NoCutoff
         constraints=app.HBonds,
-        removeCMMotion=True
+        removeCMMotion=True,
+        implicitSolvent=app.GBn2,
+        implicitSolventSaltConc=0.1 * unit.molar  # optional, tweak as you like
     )
 
     # 5) Align model CA to refined CA
