@@ -22,8 +22,8 @@ import pandas as pd
 @dataclass
 class RefineConfig:
     # subsampling inside the best cluster
-    subsample_max: int = 64
-    top_energy_pct: float = 0.3
+    subsample_max: int = 256
+    top_energy_pct: float = 0.15
     random_seed: int = 0
 
     # anchor/medoid selection
@@ -50,9 +50,9 @@ class RefineConfig:
     gpa_iters: int = 3
     proj_enforce_bond: bool = True
     target_ca_distance: Optional[float] = 3.8  # Å
-    proj_smooth_strength: float = 0.02
+    proj_smooth_strength: float = 0.005
     proj_iters: int = 8
-    min_separation: float = 3.0
+    min_separation: float = 2.8
 
     # local polishing (optional if energy_fn provided)
     do_local_polish: bool = False

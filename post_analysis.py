@@ -33,13 +33,13 @@ def main():
 
     # === User parameters ===
     input_path = "e_results/1m7y/energies.jsonl"  # path to your energy file
-    refine_mode = "standard"                      # "fast", "standard", or "premium"
-    subsample_max = 64
-    top_energy_pct = 0.30
+    refine_mode = "premium"                      # "fast", "standard", or "premium"
+    subsample_max = 256
+    top_energy_pct = 0.15
     geom_thresh = 8.5
     steric_ok = True
     target_ca_distance = 3.8
-    random_seed = 42
+    random_seed = 247
     do_local_polish = False                       # True if you have energy_fn
 
     # === Derived paths ===
