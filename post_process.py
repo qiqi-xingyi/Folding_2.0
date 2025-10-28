@@ -21,6 +21,7 @@ cfg = OrchestratorConfig(
     aggregate_only=True,
 )
 
+
 if __name__ == "__main__":
     runner = PipelineOrchestrator(cfg)
     summary = runner.run()
