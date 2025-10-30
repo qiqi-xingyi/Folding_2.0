@@ -17,6 +17,12 @@ from qsadpp.io_reader import SampleReader, ReaderOptions
 from qsadpp.coordinate_decoder import CoordinateBatchDecoder, CoordinateDecoderConfig
 from qsadpp.energy_calculator import LatticeEnergyCalculator, EnergyConfig
 
+# NEW: structural features (geometry + pseudo atoms)
+try:
+    from qsadpp.feature_calculator import FeatureConfig, StructuralFeatureCalculator
+    _FEATURES_AVAILABLE = True
+except Exception:
+    _FEATURES_AVAILABLE = False
 
 _LOG = logging.getLogger(__name__)
 if not _LOG.handlers:
@@ -34,7 +40,7 @@ def _ensure_dir(path: str) -> None:
 class OrchestratorConfig:
     """
     End-to-end pipeline:
-      read -> per-group decode -> per-group energy -> aggregate per PDB.
+      read -> per-group decode -> per-group energy -> aggregate per PDB -> (optional) per-group features -> aggregate.
 
     Notes:
       - We assume all CSVs under `pdb_dir` belong to the same protein (pdbid).
@@ -75,6 +81,15 @@ class OrchestratorConfig:
     decoder_output_format: str = "jsonl"  # "jsonl" | "parquet"
     strict_decode: bool = False
 
+    # ---------- NEW: feature calculation controls ----------
+    compute_features: bool = False                 # turn on to compute extra geometry/statistics features
+    feature_from: str = "decoded"                  # "decoded" or "energies" as input to feature calculator
+    feature_tpl: str = "{protein}_{label}_g{gid}.features.jsonl"  # per-group features file
+    combined_feature_name: str = "features.jsonl"  # aggregated features filename under <out_dir>/<pdbid>
+
+    # pass-through config to StructuralFeatureCalculator (safe defaults if you don't touch)
+    feature_config: Optional["FeatureConfig"] = None
+
 
 class PipelineOrchestrator:
     """
@@ -82,7 +97,8 @@ class PipelineOrchestrator:
       - stream groups from SampleReader
       - decode each group's bitstrings to coordinates
       - evaluate energies on decoded coordinates
-      - append all groups to <out_dir>/<pdbid>/decoded.jsonl and energies.jsonl
+      - optionally compute extra features on decoded/energies
+      - append all groups to <out_dir>/<pdbid>/{decoded.jsonl, energies.jsonl, features.jsonl}
       - optionally remove per-group intermediate files
     """
 
@@ -96,6 +112,7 @@ class PipelineOrchestrator:
         # Will be initialized after seeing the first group (we need pdbid)
         self.decoded_all_path: Optional[str] = None
         self.energy_all_path: Optional[str] = None
+        self.features_all_path: Optional[str] = None
         self._pdb_root: Optional[str] = None
 
         # Reusable energy calculator (avoid reloading MJ per group)
@@ -103,6 +120,13 @@ class PipelineOrchestrator:
 
         # Optional decoder cache keyed by sequence
         self._decoder_cache: Dict[str, CoordinateBatchDecoder] = {}
+
+        # NEW: features calculator (lazy set after we know output_path)
+        self.feat_calc: Optional["StructuralFeatureCalculator"] = None
+
+        if self.cfg.compute_features and not _FEATURES_AVAILABLE:
+            _LOG.warning("Feature calculator not available: qsadpp.feature_calculator import failed. "
+                         "Set compute_features=False or ensure the module exists.")
 
     # ---------- helpers ----------
 
@@ -128,11 +152,16 @@ class PipelineOrchestrator:
             self._decoder_cache[sequence] = CoordinateBatchDecoder(dec_cfg)
         return self._decoder_cache[sequence]
 
-    def _group_paths(self, protein: str, label: str, gid: int) -> Tuple[str, str]:
+    def _group_paths(self, protein: str, label: str, gid: int) -> Tuple[str, str, str]:
         """Per-group intermediate files (kept or removed depending on `aggregate_only`)."""
         decoded_name = self.cfg.decoded_tpl.format(protein=protein, label=label, gid=gid)
-        energy_name = self.cfg.energy_tpl.format(protein=protein, label=label, gid=gid)
-        return os.path.join(self.cfg.out_dir, decoded_name), os.path.join(self.cfg.out_dir, energy_name)
+        energy_name  = self.cfg.energy_tpl.format(protein=protein, label=label, gid=gid)
+        feature_name = self.cfg.feature_tpl.format(protein=protein, label=label, gid=gid)
+        return (
+            os.path.join(self.cfg.out_dir, decoded_name),
+            os.path.join(self.cfg.out_dir, energy_name),
+            os.path.join(self.cfg.out_dir, feature_name),
+        )
 
     def _init_pdb_aggregate_paths(self, pdbid: str) -> None:
         """Create <out_dir>/<pdbid>/ and prepare combined files."""
@@ -140,10 +169,21 @@ class PipelineOrchestrator:
         _ensure_dir(self._pdb_root)
         decoded_name, energy_name = self.cfg.combined_names
         self.decoded_all_path = os.path.join(self._pdb_root, decoded_name)
-        self.energy_all_path = os.path.join(self._pdb_root, energy_name)
+        self.energy_all_path  = os.path.join(self._pdb_root, energy_name)
         # truncate (start fresh)
         open(self.decoded_all_path, "w", encoding="utf-8").close()
         open(self.energy_all_path, "w", encoding="utf-8").close()
+
+        # NEW: aggregated features file (only if needed)
+        if self.cfg.compute_features:
+            self.features_all_path = os.path.join(self._pdb_root, self.cfg.combined_feature_name)
+            open(self.features_all_path, "w", encoding="utf-8").close()
+
+            # init feature calculator with final aggregated output path context
+            if _FEATURES_AVAILABLE:
+                fcfg = self.cfg.feature_config or FeatureConfig()
+                # do not set output_path here; we will set per-group file below
+                self.feat_calc = StructuralFeatureCalculator(fcfg)
 
     @staticmethod
     def _append_file(from_path: str, to_path: Optional[str]) -> None:
@@ -156,7 +196,7 @@ class PipelineOrchestrator:
 
     # ---------- main API ----------
 
-    def run(self) -> Dict[str, int]:
+    def run(self) -> Dict[str, int | str]:
         """
         Execute the full pipeline over all groups yielded by SampleReader.
         Returns summary with counts and combined file paths.
@@ -164,6 +204,7 @@ class PipelineOrchestrator:
         groups = 0
         decoded_rows_total = 0
         energy_rows_total = 0
+        feature_rows_total = 0
         pdb_initialized = False
 
         for (protein, label, gid), df, meta in self.reader.iter_groups():
@@ -186,9 +227,10 @@ class PipelineOrchestrator:
             decoder = self._build_decoder(seq0)
 
             # Per-group intermediate paths
-            decoded_path, energy_path = self._group_paths(protein, label, gid)
+            decoded_path, energy_path, feature_path = self._group_paths(protein, label, gid)
             _ensure_dir(os.path.dirname(decoded_path))
             _ensure_dir(os.path.dirname(energy_path))
+            _ensure_dir(os.path.dirname(feature_path))
 
             # ---- Decode ----
             in_df = df[[decoder.cfg.bitstring_col, decoder.cfg.sequence_col]].copy()
@@ -211,25 +253,52 @@ class PipelineOrchestrator:
             # Append to combined energies file
             self._append_file(energy_path, self.energy_all_path)
 
+            # ---- NEW: Features (optional) ----
+            if self.cfg.compute_features and self.feat_calc is not None:
+                # choose source (decoded or energies)
+                src_path = decoded_path if self.cfg.feature_from == "decoded" else energy_path
+                # set per-group output
+                self.feat_calc.cfg.output_path = feature_path
+                _LOG.info(
+                    "Computing features for group (%s, %s, %s) from %s -> %s",
+                    protein, label, gid, self.cfg.feature_from, feature_path
+                )
+                fsum = self.feat_calc.evaluate_jsonl(src_path, output_path=feature_path)
+                feature_rows_total += int(fsum.get("written", 0))
+
+                # append to combined features
+                self._append_file(feature_path, self.features_all_path)
+
             # Optionally remove intermediate files
             if self.cfg.aggregate_only:
-                try:
-                    os.remove(decoded_path)
-                except OSError:
-                    pass
-                try:
-                    os.remove(energy_path)
-                except OSError:
-                    pass
+                # Remove decoded/energy group files
+                for p in (decoded_path, energy_path):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                # Remove feature group file if created
+                if self.cfg.compute_features:
+                    try:
+                        os.remove(feature_path)
+                    except OSError:
+                        pass
 
         _LOG.info(
-            "Pipeline finished: %d groups, %d decoded rows, %d energy rows. Combined: %s, %s",
-            groups, decoded_rows_total, energy_rows_total, self.decoded_all_path, self.energy_all_path
+            "Pipeline finished: %d groups, %d decoded rows, %d energy rows%s. Combined: %s, %s%s",
+            groups, decoded_rows_total, energy_rows_total,
+            (f", {feature_rows_total} feature rows" if self.cfg.compute_features else ""),
+            self.decoded_all_path, self.energy_all_path,
+            (f", {self.features_all_path}" if self.cfg.compute_features else "")
         )
-        return {
+        summary: Dict[str, int | str] = {
             "groups": groups,
             "decoded_rows": decoded_rows_total,
             "energy_rows": energy_rows_total,
             "decoded_all": self.decoded_all_path or "",
             "energies_all": self.energy_all_path or "",
         }
+        if self.cfg.compute_features:
+            summary["feature_rows"] = feature_rows_total
+            summary["features_all"] = self.features_all_path or ""
+        return summary
