@@ -10,7 +10,7 @@ from qsadpp.io_reader import ReaderOptions
 cfg = OrchestratorConfig(
     pdb_dir="./quantum_data/1m7y",
     reader_options=ReaderOptions(
-        chunksize=100_000,
+        chunksize=100000,
         strict=True,
         categorize_strings=True,
         include_all_csv=False,
