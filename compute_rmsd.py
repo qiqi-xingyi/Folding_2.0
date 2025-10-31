@@ -26,7 +26,7 @@ import numpy as np
 
 
 # ====== DEFAULT PATHS (edit here if needed) ======
-PRED_PDB  = os.path.join("e_results", "1m7y", "allatom_refined.pdb")
+PRED_PDB  = os.path.join("e_results", "1m7y", "refined_ca.pdb")
 INDEX_TSV = os.path.join("dataset", "benchmark_info.txt")
 DATA_ROOT = os.path.join("dataset", "Pdbbind")
 
@@ -273,8 +273,6 @@ def main():
     print(f"Orientation      : {'reversed' if best['reversed'] else 'forward'}")
     print(f"RMSD (Å)         : {best['val']:.4f}")
     print(f"Aligned PDB      : {out_pdb}")
-
-
 
 
 if __name__ == "__main__":
