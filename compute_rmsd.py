@@ -275,9 +275,6 @@ def main():
     print(f"Aligned PDB      : {out_pdb}")
 
 
-    # Keep console open if double-clicked (optional)
-    if sys.stdout.isatty() is False:
-        input("\nPress <Enter> to exit...")
 
 
 if __name__ == "__main__":
