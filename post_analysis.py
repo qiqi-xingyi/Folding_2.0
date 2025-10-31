@@ -1,19 +1,18 @@
-# --*-- conding:utf-8 --*--
-# @time:10/23/25 18:25
+# --*-- coding:utf-8 --*--
+# @time:10/31/25 19:55
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
 # @File:analysis.py
-
 """
 Top-level entry for QSAD analysis and structure reconstruction.
 Steps:
-  1. Load energy JSONL file (quantum sampling results)
-  2. Perform clustering on main_vectors
-  3. Select best-energy cluster
-  4. Reconstruct & refine the Cα-only structure
+  1) Load energy and feature JSONL files (quantum sampling results)
+  2) Perform multi-view clustering (geometry/feature/bitstring) with energy bias
+  3) Select the best-energy cluster
+  4) Reconstruct and refine the Cα-only structure
 Outputs:
-  - cluster_out/: clustering reports
-  - refined_ca.pdb / refined_ca.csv / refine_report.json in same directory as input
+  - <input_dir>/cluster_out/: clustering reports
+  - refined_ca.pdb / refined_ca.csv / refine_report.json in <input_dir>
 """
 
 import os
@@ -32,59 +31,68 @@ def main():
     setup_logging()
 
     # === User parameters ===
-    input_path = "e_results/1m7y/energies.jsonl"  # path to your energy file
-    refine_mode = "premium"                      # "fast", "standard", or "premium"
+    energies_path = "e_results/1m7y/energies.jsonl"
+    features_path = "e_results/1m7y/features.jsonl"
+    refine_mode = "premium"  # "fast" | "standard" | "premium"
     subsample_max = 5
     top_energy_pct = 0.2
-    geom_thresh = 5.5
-    steric_ok = True
+    geom_thresh = 5.5  # E_geom ≤ geom_thresh
+    require_no_steric = True  # E_steric == 0
     target_ca_distance = 3.7
     random_seed = 24
-    do_local_polish = False                       # True if you have energy_fn
+    do_local_polish = False
 
-    # === Derived paths ===
-    input_dir = os.path.dirname(os.path.abspath(input_path)) or "."
+    # === Paths ===
+    input_dir = os.path.dirname(os.path.abspath(energies_path)) or "."
     cluster_out = os.path.join(input_dir, "cluster_out")
     os.makedirs(cluster_out, exist_ok=True)
 
     logging.info("=== QSAD Reconstruction ===")
-    logging.info("Input file : %s", input_path)
-    logging.info("Output dir : %s", input_dir)
-    logging.info("Cluster dir: %s", cluster_out)
+    logging.info("Energies : %s", energies_path)
+    logging.info("Features : %s", features_path)
+    logging.info("Out dir  : %s", input_dir)
+    logging.info("Clusters : %s", cluster_out)
 
     # ---------------------------
     # 1) Cluster analysis
     # ---------------------------
-    pre_rules = {}
-    if geom_thresh is not None:
-        pre_rules[f"E_geom<={geom_thresh}"] = True
-    if steric_ok:
-        pre_rules["E_steric<=0"] = True
-
     c_cfg = ClusterConfig(
-        method="kmedoids",
-        k_candidates=[8, 9, 10],
+        use_geom=True, use_feat=True, use_ham=True,
+        w_geom=0.5, w_feat=0.3, w_ham=0.2,
+        knn=40, diff_dim=10, diff_time=2,
+        n_runs=5, min_cluster_size=25,
+        seed=random_seed,
+        bitstring_col="bitstring",
+        positions_col="main_positions",
         energy_key="E_total",
-        prefilter_rules=pre_rules,
-        random_seed=random_seed,
-        output_dir=cluster_out,
-        main_vectors_col="main_vectors",
-        strict_same_length=True,
     )
 
     analyzer = ClusterAnalyzer(c_cfg)
-    analyzer.load_file(input_path)
+    analyzer.load_files(energies_path, features_path)
+
+    # Prefilter data before clustering
+    if geom_thresh is not None and "E_geom" in analyzer.df.columns:
+        before = len(analyzer.df)
+        analyzer.df = analyzer.df[analyzer.df["E_geom"] <= float(geom_thresh)].reset_index(drop=True)
+        logging.info("Prefilter E_geom ≤ %.3f: %d → %d", geom_thresh, before, len(analyzer.df))
+    if require_no_steric and "E_steric" in analyzer.df.columns:
+        before = len(analyzer.df)
+        analyzer.df = analyzer.df[analyzer.df["E_steric"] <= 0.0].reset_index(drop=True)
+        logging.info("Prefilter E_steric == 0: %d → %d", before, len(analyzer.df))
+
+    if len(analyzer.df) < 2:
+        logging.error("Not enough samples after prefilter. Abort.")
+        return
+
     analyzer.fit()
-    analyzer.save_reports()
+    analyzer.save_reports(cluster_out)
 
     best_idx = analyzer.get_best_cluster_indices()
     if not best_idx:
-        logging.error("No best cluster Pdbbind. Check thresholds or data integrity.")
+        logging.error("No best cluster found. Check thresholds or data integrity.")
         return
 
-    # Extract the best cluster data
-    df_raw: pd.DataFrame = analyzer.df_raw  # type: ignore
-    best_cluster_df = df_raw.iloc[best_idx].reset_index(drop=True)
+    best_cluster_df: pd.DataFrame = analyzer.df.iloc[best_idx].reset_index(drop=True)
     logging.info("Best cluster size: %d", len(best_cluster_df))
 
     # ---------------------------
@@ -106,7 +114,6 @@ def main():
         random_seed=random_seed,
     )
 
-    # Optional energy callback (set to None by default)
     energy_fn = None
 
     refiner = StructureRefiner(r_cfg, energy_fn=energy_fn)
