@@ -59,7 +59,7 @@ def main():
     c_cfg = ClusterConfig(
         use_geom=True, use_feat=True, use_ham=True,
         w_geom=0.5, w_feat=0.3, w_ham=0.2,
-        knn=40, diff_dim=10, diff_time=2,
+        knn=40, diff_time=2,
         n_runs=5, min_cluster_size=25,
         seed=random_seed,
         bitstring_col="bitstring",
