@@ -53,18 +53,36 @@ def main():
     logging.info("Out dir  : %s", input_dir)
     logging.info("Clusters : %s", cluster_out)
 
-    # ---------------------------
-    # 1) Cluster analysis
-    # ---------------------------
+
     c_cfg = ClusterConfig(
-        use_geom=True, use_feat=True, use_ham=True,
-        w_geom=0.5, w_feat=0.3, w_ham=0.2,
-        knn=40, diff_time=2,
-        n_runs=5, min_cluster_size=25,
-        seed=random_seed,
-        bitstring_col="bitstring",
+        # ---- views ----
+        use_geom=True,  # use geometric view (RMSD-based)
+        use_feat=True,  # use feature-space view
+        use_ham=False,  # disable bitstring view for stability (enable later if needed)
+
+        # ---- view weights ----
+        w_geom=0.5,  # geometry dominates
+        w_feat=0.4,  # features assist
+        w_ham=0.1,  # bitstring optional contribution
+
+        # ---- graph & diffusion ----
+        knn=80,  # neighbors per node (increase to 100 if disconnected)
+        diffusion_dim=12,  # embedding dimension for diffusion map
+        diff_time=2,  # diffusion time t
+
+        # ---- clustering ----
+        k_candidates=[8, 10, 12],  # candidate number of clusters for balanced selection
+        energy_weight_beta=2.5,  # low-energy emphasis
+        max_cluster_frac=0.6,  # avoid one giant cluster dominating
+
+        # ---- data columns ----
+        bitstring_col="bitstring",  # bitstring column name
         positions_col="main_positions",
         energy_key="E_total",
+
+        # ---- misc ----
+        seed=random_seed,
+        output_dir="e_results/1m7y/cluster_out"
     )
 
     analyzer = ClusterAnalyzer(c_cfg)
