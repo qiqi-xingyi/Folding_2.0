@@ -119,7 +119,7 @@ def main():
     parser.add_argument("--score_mode", type=str, default="expected_rel",
                         choices=["prob_rel3", "logit_rel3", "expected_rel"])
     parser.add_argument("--lambda_ce", type=float, default=0.33)
-    parser.add_argument("--max_pairs_per_group", type=int, default=64)
+    parser.add_argument("--max_pairs_per_group", type=int, default=256)
     parser.add_argument("--use_rank_head", action="store_true", default=True)
     parser.add_argument("--monitor_alpha", type=float, default=0.5, help="weight for NDCG in early-stop mix metric")
     args = parser.parse_args()
