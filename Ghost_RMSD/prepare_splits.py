@@ -4,8 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:prepare_splits.py
 
-# -*- coding: utf-8 -*-
-# Prepare ML splits and normalized features from all_examples_grouped.jsonl
 
 import json
 import random
@@ -13,10 +11,10 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "training_data"
-INPUT_FILE = DATA_DIR / "training_dataset.jsonl"
+DATA_DIR = ROOT / "training_dataset"
+INPUT_FILE = DATA_DIR / "all_examples_grouped.jsonl"
 
-TRAIN_OUT = DATA_DIR / "training_dataset.jsonl"
+TRAIN_OUT = DATA_DIR / "train.jsonl"
 VALID_OUT = DATA_DIR / "valid.jsonl"
 TEST_OUT  = DATA_DIR / "test.jsonl"
 

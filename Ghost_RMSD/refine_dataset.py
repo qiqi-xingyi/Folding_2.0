@@ -15,7 +15,7 @@ from collections import defaultdict
 
 ROOT = Path(__file__).resolve().parent
 IN_FILE = ROOT / "training_data" / "all_examples.jsonl"
-OUT_FILE = ROOT / "training_data" / "training_dataset.jsonl"
+OUT_FILE = ROOT / "training_data" / "all_examples_grouped.jsonl"
 
 
 def reorder_keys(d: dict, first_keys: list[str]) -> dict:
