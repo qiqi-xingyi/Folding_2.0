@@ -4,8 +4,7 @@
 # @Email : yzhan135@kent.edu
 # @File:model.py
 
-# grn_simple/model.py
-import math
+# GRN/model.py
 from typing import List, Optional, Dict
 
 import torch
@@ -14,7 +13,7 @@ import torch.nn.functional as F
 
 
 class MLPBlock(nn.Module):
-    """Linear -> ReLU -> Dropout (optional) with optional BatchNorm."""
+    """Linear -> (BatchNorm) -> ReLU -> (Dropout)."""
 
     def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0, use_bn: bool = True):
         super().__init__()
@@ -37,25 +36,24 @@ class MLPBlock(nn.Module):
 
 class GRNClassifier(nn.Module):
     """
-    Minimal classifier for Ghost RMSD labels (rel ∈ {0,1,2,3}).
-    - Input: numeric feature vector (z-scored), shape [B, D]
-    - Output:
-        logits: [B, 4]
-        probs : [B, 4] (softmax)
-        score : [B]   (scalar ranking score; larger => better)
+    GRN with:
+      - numeric backbone (MLP) on prepared features
+      - classification head for 4-level labels (rel ∈ {0,1,2,3})
+      - optional independent ranking head (scalar score for RankNet)
     """
 
     def __init__(
         self,
         in_dim: int,
         hidden_dims: Optional[List[int]] = None,
-        dropout: float = 0.2,
+        dropout: float = 0.3,
         use_bn: bool = True,
-        score_mode: str = "prob_rel3",  # "prob_rel3" | "logit_rel3" | "expected_rel"
+        score_mode: str = "expected_rel",  # used when rank_head is False
+        use_rank_head: bool = True,        # if True, ranking uses an independent linear head
     ):
         super().__init__()
         if hidden_dims is None:
-            hidden_dims = [128, 64]
+            hidden_dims = [256, 128]
 
         layers: List[nn.Module] = []
         d_prev = in_dim
@@ -64,19 +62,27 @@ class GRNClassifier(nn.Module):
             d_prev = d
         self.backbone = nn.Sequential(*layers) if layers else nn.Identity()
 
+        # classification head
         self.classifier = nn.Linear(d_prev, 4)
         nn.init.xavier_uniform_(self.classifier.weight)
         if self.classifier.bias is not None:
             nn.init.zeros_(self.classifier.bias)
 
-        self.score_mode = score_mode
+        # independent ranking head
+        self.use_rank_head = use_rank_head
+        if self.use_rank_head:
+            self.rank_head = nn.Linear(d_prev, 1)
+            nn.init.xavier_uniform_(self.rank_head.weight)
+            if self.rank_head.bias is not None:
+                nn.init.zeros_(self.rank_head.bias)
+        else:
+            self.rank_head = None
+
+        self.score_mode = score_mode  # used only if rank_head is disabled
 
     @torch.no_grad()
-    def _make_score(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        Convert logits to a scalar ranking score.
-        Larger score should indicate higher quality (lower RMSD).
-        """
+    def _make_score_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Fallback scoring when rank_head is disabled."""
         if self.score_mode == "prob_rel3":
             probs = F.softmax(logits, dim=-1)
             return probs[..., 3]  # probability of best class
@@ -94,13 +100,30 @@ class GRNClassifier(nn.Module):
         h = self.backbone(x)
         logits = self.classifier(h)
         probs = F.softmax(logits, dim=-1)
-        score = self._make_score(logits)
-        return {"logits": logits, "probs": probs, "score": score}
+
+        if self.use_rank_head:
+            # independent scalar score for ranking loss
+            rank_score = self.rank_head(h).squeeze(-1)
+        else:
+            # derive a scalar score from logits
+            rank_score = self._make_score_from_logits(logits)
+
+        return {"logits": logits, "probs": probs, "score": rank_score}
 
 
-def build_grn_from_datamodule(dm, dropout: float = 0.2, use_bn: bool = True, score_mode: str = "prob_rel3") -> GRNClassifier:
-    """
-    Convenience constructor when you already have a GRNDataModule.
-    """
+def build_grn_from_datamodule(
+    dm,
+    dropout: float = 0.3,
+    use_bn: bool = True,
+    score_mode: str = "expected_rel",
+    use_rank_head: bool = True,
+) -> GRNClassifier:
+    """Convenience constructor when you already have a GRNDataModule."""
     in_dim = dm.feature_dim()
-    return GRNClassifier(in_dim=in_dim, dropout=dropout, use_bn=use_bn, score_mode=score_mode)
+    return GRNClassifier(
+        in_dim=in_dim,
+        dropout=dropout,
+        use_bn=use_bn,
+        score_mode=score_mode,
+        use_rank_head=use_rank_head,
+    )

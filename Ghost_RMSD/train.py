@@ -4,6 +4,7 @@
 # @Email : yzhan135@kent.edu
 # @File:train.py
 
+
 import argparse
 import os
 import random
@@ -54,7 +55,15 @@ def evaluate(model: nn.Module, loader, device: torch.device) -> Dict[str, float]
     return {**cls, **rnk}
 
 
-def train_one_epoch(model, loader, optimizer, device, ce_loss, lambda_ce: float, max_pairs_per_group: int):
+def train_one_epoch(
+    model: nn.Module,
+    loader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    ce_loss: nn.Module,
+    lambda_ce: float,
+    max_pairs_per_group: int,
+):
     model.train()
     total_loss = 0.0
     total_n = 0
@@ -68,10 +77,10 @@ def train_one_epoch(model, loader, optimizer, device, ce_loss, lambda_ce: float,
         logits = out["logits"]
         scores = out["score"]
 
-        # classification loss
+        # classification loss (weighted CE)
         L_ce = ce_loss(logits, y)
 
-        # pairwise ranknet loss (build pairs on CPU, then move to device indexing)
+        # rank pairs per group (built on CPU for simplicity; then move indices to device)
         pairs = build_pairs(gid.cpu(), y.cpu(), max_pairs_per_group=max_pairs_per_group)
         L_rank = ranknet_loss(scores, pairs.to(device)) if pairs.numel() > 0 else torch.zeros([], device=device)
 
@@ -109,8 +118,10 @@ def main():
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--score_mode", type=str, default="expected_rel",
                         choices=["prob_rel3", "logit_rel3", "expected_rel"])
-    parser.add_argument("--lambda_ce", type=float, default=0.5)
-    parser.add_argument("--max_pairs_per_group", type=int, default=32)
+    parser.add_argument("--lambda_ce", type=float, default=0.33)
+    parser.add_argument("--max_pairs_per_group", type=int, default=64)
+    parser.add_argument("--use_rank_head", action="store_true", default=True)
+    parser.add_argument("--monitor_alpha", type=float, default=0.5, help="weight for NDCG in early-stop mix metric")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -121,8 +132,13 @@ def main():
     dm = GRNDataModule(data_dir=args.data_dir, batch_size=args.batch_size)
     dm.setup()
 
-    # Model
-    model = build_grn_from_datamodule(dm, dropout=args.dropout, score_mode=args.score_mode)
+    # Model (enable independent rank head by default)
+    model = build_grn_from_datamodule(
+        dm,
+        dropout=args.dropout,
+        score_mode=args.score_mode,
+        use_rank_head=args.use_rank_head,
+    )
     model.to(device)
 
     # Optimizer / Loss (class weights to fight imbalance)
@@ -130,7 +146,7 @@ def main():
     class_weight = compute_class_weight(dm.ds_train).to(device)
     ce_loss = nn.CrossEntropyLoss(weight=class_weight)
 
-    best_val = -1.0
+    best_monitor = -1.0
     best_epoch = -1
     patience_left = args.patience
     ckpt_path = Path(args.save_dir) / "grn_best.pt"
@@ -141,14 +157,17 @@ def main():
             ce_loss, args.lambda_ce, args.max_pairs_per_group
         )
         val_metrics = evaluate(model, dm.valid_dataloader(), device)
-        monitor = val_metrics.get("ndcg@10", 0.0)
+
+        # mixed early-stop metric: alpha * ndcg@10 + (1-alpha) * spearman
+        alpha = args.monitor_alpha
+        mixed_monitor = alpha * val_metrics.get("ndcg@10", 0.0) + (1.0 - alpha) * val_metrics.get("spearman", 0.0)
 
         print(f"[Epoch {epoch:03d}] train_loss={train_loss:.4f} | "
               f"val_acc={val_metrics['acc']:.4f} | val_ndcg@10={val_metrics['ndcg@10']:.4f} | "
-              f"val_spearman={val_metrics['spearman']:.4f}")
+              f"val_spearman={val_metrics['spearman']:.4f} | monitor={mixed_monitor:.4f}")
 
-        if monitor > best_val:
-            best_val = monitor
+        if mixed_monitor > best_monitor:
+            best_monitor = mixed_monitor
             best_epoch = epoch
             patience_left = args.patience
             torch.save({
@@ -159,12 +178,13 @@ def main():
                 "scaler": dm.scaler,
                 "args": vars(args),
                 "val_metrics": val_metrics,
+                "monitor": mixed_monitor,
             }, ckpt_path)
             print(f"  -> Saved new best to {ckpt_path}")
         else:
             patience_left -= 1
             if patience_left <= 0:
-                print(f"Early stopping at epoch {epoch}. Best epoch {best_epoch} (val_ndcg@10={best_val:.4f}).")
+                print(f"Early stopping at epoch {epoch}. Best epoch {best_epoch} (monitor={best_monitor:.4f}).")
                 break
 
     # Test with best ckpt
