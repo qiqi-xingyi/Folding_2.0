@@ -10,9 +10,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from grn_simple.data import GRNDataModule, GRNDataset
-from grn_simple.model import GRNClassifier
-from grn_simple.metrics import summarize_classification, summarize_ranking
+from GRN.data import GRNDataModule
+from GRN.model import build_grn_from_datamodule
+from GRN.metrics import summarize_classification, summarize_ranking
 
 
 @torch.no_grad()

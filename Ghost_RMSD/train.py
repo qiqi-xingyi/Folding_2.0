@@ -16,9 +16,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from grn_simple.data import GRNDataModule
-from grn_simple.model import build_grn_from_datamodule
-from grn_simple.metrics import summarize_classification, summarize_ranking
+from GRN.data import GRNDataModule
+from GRN.model import build_grn_from_datamodule
+from GRN.metrics import summarize_classification, summarize_ranking
 
 
 def set_seed(seed: int = 42):
