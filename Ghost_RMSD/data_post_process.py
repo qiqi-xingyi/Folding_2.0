@@ -16,9 +16,9 @@ from qsadpp.feature_calculator import FeatureConfig
 
 # --------- Paths ---------
 ROOT = Path(__file__).resolve().parent
-TRAIN_DIR = ROOT / "training_data"       # contains samples_*.csv
+TRAIN_DIR = ROOT / "sampling_data"       # contains samples_*.csv
 WORK_DIR  = ROOT / "tmp_work"            # per-protein staging dir (created/removed)
-OUT_DIR   = ROOT / "training_dataset"    # new output root directory
+OUT_DIR   = ROOT / "training_data"    # new output root directory
 
 # Aggregated corpus outputs
 ALL_ENERGIES = OUT_DIR / "all_energies.jsonl"

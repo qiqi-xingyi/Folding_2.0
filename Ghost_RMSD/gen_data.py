@@ -14,7 +14,7 @@ from pathlib import Path
 # ==============================================================
 
 INDEX_FILE = "benchmark_info.txt"     # index file in the same directory
-OUTPUT_DIR = "training_data"          # output directory
+OUTPUT_DIR = "sampling_data"  # output directory
 PER_GROUP = 5000                      # number of samples per protein
 SUBTRACT_BITS = 5                     # bit length = qubits - SUBTRACT_BITS
 SHOTS = 2000                          # prob = count / shots

@@ -8,7 +8,7 @@
 # - Merge energies (JSONL) + features (JSONL) by (sequence, bitstring)
 # - Compute CA-RMSD of candidate main_positions vs reference PDB fragment
 # - Assign graded relevance labels by thresholds
-# - Write one JSONL corpus: training_dataset/all_examples.jsonl
+# - Write one JSONL corpus: training_data/all_examples.jsonl
 
 import os
 import json
@@ -18,7 +18,7 @@ import numpy as np
 
 # -------------------- Paths --------------------
 ROOT = Path(__file__).resolve().parent
-OUT_DIR = ROOT / "training_dataset"
+OUT_DIR = ROOT / "training_data"
 ENERGIES_FILE = OUT_DIR / "all_energies.jsonl"
 FEATURES_FILE = OUT_DIR / "all_features.jsonl"
 INDEX_FILE = ROOT / "benchmark_info.txt"
