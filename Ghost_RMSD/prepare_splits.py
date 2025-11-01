@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Any
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "training_dataset"
+DATA_DIR = ROOT / "training_data"
 INPUT_FILE = DATA_DIR / "all_examples_grouped.jsonl"
 
 TRAIN_OUT = DATA_DIR / "train.jsonl"
