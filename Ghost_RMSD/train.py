@@ -4,12 +4,14 @@
 # @Email : yzhan135@kent.edu
 # @File:train.py
 
-
+# scripts/train.py
 import argparse
 import os
+import csv
+import json
 import random
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -32,7 +34,7 @@ def set_seed(seed: int = 42):
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader, device: torch.device) -> Dict[str, float]:
+def evaluate(model: nn.Module, loader, device: torch.device, return_details: bool = False):
     model.eval()
     all_logits, all_scores, all_labels, all_groups, all_rmsd = [], [], [], [], []
     for batch in loader:
@@ -52,7 +54,18 @@ def evaluate(model: nn.Module, loader, device: torch.device) -> Dict[str, float]
 
     cls = summarize_classification(logits, labels)
     rnk = summarize_ranking(logits, scores, labels, rmsd, groups, ks=(5, 10, 20))
-    return {**cls, **rnk}
+    metrics = {**cls, **rnk}
+
+    if return_details:
+        details = {
+            "logits": logits,
+            "scores": scores,
+            "labels": labels,
+            "groups": groups,
+            "rmsd": rmsd,
+        }
+        return metrics, details
+    return metrics
 
 
 def train_one_epoch(
@@ -63,7 +76,7 @@ def train_one_epoch(
     ce_loss: nn.Module,
     lambda_ce: float,
     max_pairs_per_group: int,
-):
+) -> float:
     model.train()
     total_loss = 0.0
     total_n = 0
@@ -77,10 +90,10 @@ def train_one_epoch(
         logits = out["logits"]
         scores = out["score"]
 
-        # classification loss (weighted CE)
+        # classification loss
         L_ce = ce_loss(logits, y)
 
-        # rank pairs per group (built on CPU for simplicity; then move indices to device)
+        # ranknet loss
         pairs = build_pairs(gid.cpu(), y.cpu(), max_pairs_per_group=max_pairs_per_group)
         L_rank = ranknet_loss(scores, pairs.to(device)) if pairs.numel() > 0 else torch.zeros([], device=device)
 
@@ -104,35 +117,54 @@ def compute_class_weight(train_ds) -> torch.Tensor:
     return torch.tensor(w, dtype=torch.float32)
 
 
+def append_csv_row(csv_path: Path, row: Dict[str, float], header_written: bool):
+    fieldnames = list(row.keys())
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not header_written:
+            writer.writeheader()
+        writer.writerow(row)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="training_dataset")
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=100)  # allow longer training
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=3e-4)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--patience", type=int, default=7)
+    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--no_early_stop", action="store_true", default=False)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--score_mode", type=str, default="expected_rel",
                         choices=["prob_rel3", "logit_rel3", "expected_rel"])
     parser.add_argument("--lambda_ce", type=float, default=0.33)
-    parser.add_argument("--max_pairs_per_group", type=int, default=256)
+    parser.add_argument("--max_pairs_per_group", type=int, default=128)
     parser.add_argument("--use_rank_head", action="store_true", default=True)
     parser.add_argument("--monitor_alpha", type=float, default=0.5, help="weight for NDCG in early-stop mix metric")
+    parser.add_argument("--dump_predictions", action="store_true", default=False,
+                        help="save validation/test predictions arrays for plotting")
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device(args.device)
-    os.makedirs(args.save_dir, exist_ok=True)
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # set up log files
+    csv_log = save_dir / "train_log.csv"
+    json_log = save_dir / "train_log.json"
+    header_written = csv_log.exists()
+    history = []  # will also be saved to JSON
 
     # Data
     dm = GRNDataModule(data_dir=args.data_dir, batch_size=args.batch_size)
     dm.setup()
 
-    # Model (enable independent rank head by default)
+    # Model
     model = build_grn_from_datamodule(
         dm,
         dropout=args.dropout,
@@ -141,7 +173,7 @@ def main():
     )
     model.to(device)
 
-    # Optimizer / Loss (class weights to fight imbalance)
+    # Optimizer / Loss
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     class_weight = compute_class_weight(dm.ds_train).to(device)
     ce_loss = nn.CrossEntropyLoss(weight=class_weight)
@@ -149,7 +181,8 @@ def main():
     best_monitor = -1.0
     best_epoch = -1
     patience_left = args.patience
-    ckpt_path = Path(args.save_dir) / "grn_best.pt"
+    ckpt_best = save_dir / "grn_best.pt"
+    ckpt_last = save_dir / "grn_last.pt"
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(
@@ -158,7 +191,6 @@ def main():
         )
         val_metrics = evaluate(model, dm.valid_dataloader(), device)
 
-        # mixed early-stop metric: alpha * ndcg@10 + (1-alpha) * spearman
         alpha = args.monitor_alpha
         mixed_monitor = alpha * val_metrics.get("ndcg@10", 0.0) + (1.0 - alpha) * val_metrics.get("spearman", 0.0)
 
@@ -166,6 +198,28 @@ def main():
               f"val_acc={val_metrics['acc']:.4f} | val_ndcg@10={val_metrics['ndcg@10']:.4f} | "
               f"val_spearman={val_metrics['spearman']:.4f} | monitor={mixed_monitor:.4f}")
 
+        # append to CSV and JSON history
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_acc": val_metrics["acc"],
+            "val_ndcg@5": val_metrics["ndcg@5"],
+            "val_ndcg@10": val_metrics["ndcg@10"],
+            "val_ndcg@20": val_metrics["ndcg@20"],
+            "val_spearman": val_metrics["spearman"],
+            "monitor": mixed_monitor,
+            "lr": optimizer.param_groups[0]["lr"],
+            "lambda_ce": args.lambda_ce,
+            "max_pairs_per_group": args.max_pairs_per_group,
+            "dropout": args.dropout,
+        }
+        append_csv_row(csv_log, row, header_written=header_written)
+        header_written = True
+        history.append(row)
+        with json_log.open("w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+
+        # checkpointing
         if mixed_monitor > best_monitor:
             best_monitor = mixed_monitor
             best_epoch = epoch
@@ -179,24 +233,44 @@ def main():
                 "args": vars(args),
                 "val_metrics": val_metrics,
                 "monitor": mixed_monitor,
-            }, ckpt_path)
-            print(f"  -> Saved new best to {ckpt_path}")
+            }, ckpt_best)
+            print(f"  -> Saved new best to {ckpt_best}")
         else:
             patience_left -= 1
-            if patience_left <= 0:
-                print(f"Early stopping at epoch {epoch}. Best epoch {best_epoch} (monitor={best_monitor:.4f}).")
-                break
 
-    # Test with best ckpt
-    if ckpt_path.exists():
-        ckpt = torch.load(ckpt_path, map_location=device)
+        # always save last checkpoint (for resuming or debugging)
+        torch.save({
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "args": vars(args),
+        }, ckpt_last)
+
+        # early stopping (can be disabled)
+        if not args.no_early_stop and patience_left <= 0:
+            print(f"Early stopping at epoch {epoch}. Best epoch {best_epoch} (monitor={best_monitor:.4f}).")
+            break
+
+    # Final evaluation with best checkpoint
+    if ckpt_best.exists():
+        ckpt = torch.load(ckpt_best, map_location=device)
         model.load_state_dict(ckpt["model_state"])
-        test_metrics = evaluate(model, dm.test_dataloader(), device)
+        test_metrics, test_details = evaluate(model, dm.test_dataloader(), device, return_details=True)
         print(f"[TEST] acc={test_metrics['acc']:.4f} | "
               f"ndcg@5={test_metrics['ndcg@5']:.4f} | ndcg@10={test_metrics['ndcg@10']:.4f} | "
               f"ndcg@20={test_metrics['ndcg@20']:.4f} | spearman={test_metrics['spearman']:.4f}")
+
+        # optional: dump predictions for plotting/analysis
+        if args.dump_predictions:
+            out_val_path = save_dir / "val_predictions.npz"
+            out_test_path = save_dir / "test_predictions.npz"
+
+            # recompute validation with details
+            val_metrics, val_details = evaluate(model, dm.valid_dataloader(), device, return_details=True)
+            np.savez_compressed(out_val_path, **val_details, **{"metrics": val_metrics})
+            np.savez_compressed(out_test_path, **test_details, **{"metrics": test_metrics})
+            print(f"[SAVED] {out_val_path} and {out_test_path}")
     else:
-        print("No checkpoint found; skip test.")
+        print("No best checkpoint found; skip final test.")
 
 
 if __name__ == "__main__":
