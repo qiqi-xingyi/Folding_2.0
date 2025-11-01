@@ -4,24 +4,19 @@
 # @Email : yzhan135@kent.edu
 # @File:gen_data.py
 
-# -- coding: utf-8 --
-# @File: gen_random_samples.py
-# @Author: Yuqi Zhang
-# @Desc: Generate random bitstring samples for Ghost RMSD dataset
-
 import os
 import csv
 import numpy as np
 from pathlib import Path
 
 # ==============================================================
-#                   CONFIGURATION
+# Configuration
 # ==============================================================
 
-INDEX_FILE = "benchmark_info.txt"
-OUTPUT_DIR = "training_data"
-PER_GROUP = 5000
-SUBTRACT_BITS = 5
+INDEX_FILE = "benchmark_info.txt"     # index file in the same directory
+OUTPUT_DIR = "training_data"          # output directory
+PER_GROUP = 5000                      # number of samples per protein
+SUBTRACT_BITS = 5                     # bit length = qubits - SUBTRACT_BITS
 SHOTS = 2000                          # prob = count / shots
 BETA = 0.0
 SEED = 42
@@ -30,11 +25,9 @@ IBM_BACKEND = "ibm_strasbourg"
 LABEL_PREFIX = "qsad_ibm"
 
 # ==============================================================
-#                       CORE FUNCTIONS
-# ==============================================================
 
-def read_benchmark_info(path):
-    """读取 benchmark_info.txt 文件"""
+
+def read_info(path):
     rows = []
     with open(path, "r", encoding="utf-8") as f:
         header = f.readline().strip().split("\t")
@@ -46,23 +39,16 @@ def read_benchmark_info(path):
     return rows
 
 
-def gen_unique_bitstrings(bit_len, n, rng):
-    """生成 n 条唯一的随机比特串"""
-    out = set()
-    while len(out) < n:
-        need = n - len(out)
-        arr = rng.integers(0, 2, size=(need, bit_len), dtype=np.uint8)
-        for bits in arr:
-            s = ''.join('1' if b else '0' for b in bits)
-            out.add(s)
-            if len(out) >= n:
-                break
-    return list(out)
+def gen_bitstrings(bit_len: int, n: int, rng: np.random.Generator):
+    """Generate n random bitstrings of given length (no dedup)."""
+    arr = rng.integers(0, 2, size=(n, bit_len), dtype=np.uint8)
+    packed = np.packbits(arr, axis=1, bitorder='big')
+    result = []
+    for row in packed:
+        s = ''.join(format(b, '08b') for b in row)[:bit_len]
+        result.append(s)
+    return result
 
-
-# ==============================================================
-#                          MAIN LOGIC
-# ==============================================================
 
 def main():
     root = Path(__file__).resolve().parent
@@ -70,7 +56,7 @@ def main():
     outdir = root / OUTPUT_DIR
     outdir.mkdir(exist_ok=True)
 
-    rows = read_benchmark_info(index_path)
+    rows = read_info(index_path)
     print(f"[INFO] Loaded {len(rows)} benchmark entries from {index_path.name}")
 
     header = [
@@ -86,7 +72,7 @@ def main():
         seq = r["Residue_sequence"].strip()
         try:
             L = int(r["Sequence_length"])
-        except:
+        except Exception:
             L = len(seq)
 
         n_qubits_raw = int(r["Number_of_qubits"])
@@ -96,7 +82,7 @@ def main():
             continue
 
         rng = np.random.default_rng(SEED + gi * 9973)
-        bitstrings = gen_unique_bitstrings(bit_len, PER_GROUP, rng)
+        bitstrings = gen_bitstrings(bit_len, PER_GROUP, rng)
 
         prob = 1.0 / SHOTS
         count = 1
@@ -108,16 +94,14 @@ def main():
             writer = csv.writer(fp)
             writer.writerow(header)
             for s in bitstrings:
-                row = [
+                writer.writerow([
                     L, bit_len, SHOTS, BETA, SEED, label, BACKEND,
-                    IBM_BACKEND, circuit_hash, pdb_id, seq,
-                    gi, s, count, prob
-                ]
-                writer.writerow(row)
+                    IBM_BACKEND, circuit_hash, pdb_id, seq, gi, s, count, prob
+                ])
 
-        print(f"[OK] {pdb_id}: {PER_GROUP} samples generated -> {out_path.name}")
+        print(f"[OK] {pdb_id}: {PER_GROUP} samples -> {out_path.name}")
 
-    print(f"\n✅ All done! Generated {len(rows)} CSV files in '{OUTPUT_DIR}/'.")
+    print("\n✅ All random bitstring files generated successfully!")
 
 
 if __name__ == "__main__":
