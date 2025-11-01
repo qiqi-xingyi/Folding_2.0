@@ -4,23 +4,38 @@
 # @Email : yzhan135@kent.edu
 # @File:data.py
 
-# grn_simple/data.py
+# GRN/data.py
 import json
 import math
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Iterable
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-
 _ID_FIELDS = {"group_id", "protein", "sequence", "bitstring", "residues"}
 _LABEL_FIELDS = {"rel", "rmsd"}
 
+_AA_LIST = list("ACDEFGHIKLMNPQRSTVWY")
+_AA_SET = set(_AA_LIST)
+# simple AA groups
+# _HYDROPHOBIC = set("AILMVFWYV")  # include V twice? ensure unique
+_HYDROPHOBIC = set("AILMVFWYV".replace("V","")) | {"V"}  # ensure V once
+_POLAR = set("STNQCY")
+_POS = set("KRH")
+_NEG = set("DE")
+_AROM = set("FWY")
+
 
 def _is_number(x) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))
+    try:
+        if isinstance(x, bool):
+            return False
+        xf = float(x)
+        return math.isfinite(xf)
+    except Exception:
+        return False
 
 
 def _load_jsonl(path: Path) -> List[Dict]:
@@ -34,20 +49,50 @@ def _load_jsonl(path: Path) -> List[Dict]:
     return out
 
 
+def _seq_stats(seq: str) -> Tuple[List[float], List[str]]:
+    """Return sequence-level statistical features and their names."""
+    seq = (seq or "").strip().upper()
+    L = max(1, len(seq))
+    # 20 AA frequency (normalized)
+    counts = {aa: 0 for aa in _AA_LIST}
+    for ch in seq:
+        if ch in counts:
+            counts[ch] += 1
+    freq = [counts[aa] / L for aa in _AA_LIST]
+
+    # physicochemical aggregates (ratios)
+    n_hyd = sum(ch in _HYDROPHOBIC for ch in seq) / L
+    n_pol = sum(ch in _POLAR for ch in seq) / L
+    n_pos = sum(ch in _POS for ch in seq) / L
+    n_neg = sum(ch in _NEG for ch in seq) / L
+    n_arom = sum(ch in _AROM for ch in seq) / L
+    n_pro = seq.count("P") / L
+    n_gly = seq.count("G") / L
+    charge_imbalance = (seq.count("K") + seq.count("R") + seq.count("H") - seq.count("D") - seq.count("E")) / L
+
+    vec = freq + [n_hyd, n_pol, n_pos, n_neg, n_arom, n_pro, n_gly, charge_imbalance]
+    names = [f"aa_freq_{aa}" for aa in _AA_LIST] + [
+        "aa_ratio_hydrophobic", "aa_ratio_polar", "aa_ratio_pos",
+        "aa_ratio_neg", "aa_ratio_arom", "aa_ratio_pro",
+        "aa_ratio_gly", "aa_charge_imbalance"
+    ]
+    return vec, names
+
+
 class GRNDataset(Dataset):
     """Tensor-ready dataset for GRN."""
 
     def __init__(
         self,
         rows: List[Dict],
-        feature_names: List[str],
+        base_feature_names: List[str],
         scaler: Dict[str, Dict[str, float]],
-        device: Optional[torch.device] = None,
+        seq_feat_names: List[str],
     ):
         self.rows = rows
-        self.feature_names = feature_names
+        self.base_feature_names = base_feature_names
         self.scaler = scaler
-        self.device = device
+        self.seq_feat_names = seq_feat_names
 
         X, y, gid, rmsd = self._vectorize(rows)
         self.X = torch.from_numpy(X).float()
@@ -57,24 +102,28 @@ class GRNDataset(Dataset):
 
     def _vectorize(self, rows: List[Dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         n = len(rows)
-        d = len(self.feature_names)
-        X = np.zeros((n, d), dtype=np.float32)
+        d_base = len(self.base_feature_names)
+        d_seq = len(self.seq_feat_names)
+        X = np.zeros((n, d_base + d_seq), dtype=np.float32)
         y = np.zeros((n,), dtype=np.int64)
         gid = np.zeros((n,), dtype=np.int64)
         rmsd = np.zeros((n,), dtype=np.float32)
 
         for i, r in enumerate(rows):
-            # features
-            for j, col in enumerate(self.feature_names):
+            # base numeric features (z-score)
+            for j, col in enumerate(self.base_feature_names):
                 val = r.get(col, 0.0)
                 if not _is_number(val):
                     val = 0.0
                 mu = self.scaler[col]["mean"]
-                sd = self.scaler[col]["std"]
-                if sd == 0.0:
-                    sd = 1.0
-                X[i, j] = (float(val) - mu) / sd
-            # labels / meta
+                sd = self.scaler[col]["std"] or 1.0
+                X[i, j] = (float(val) - mu) / (sd if sd != 0.0 else 1.0)
+
+            # sequence stats (no scaling，保持在[0,1]范围；charge_imbalance在[-1,1])
+            seq_vec, _ = _seq_stats(str(r.get("sequence", "")))
+            X[i, d_base:d_base + d_seq] = np.asarray(seq_vec, dtype=np.float32)
+
+            # labels/meta
             y[i] = int(r.get("rel", 0))
             gid[i] = int(r.get("group_id", -1))
             rmsd[i] = float(r.get("rmsd", float("nan")))
@@ -94,9 +143,9 @@ class GRNDataset(Dataset):
 
 class GRNDataModule:
     """
-    Minimal data module for GRN.
-    - Auto-detect numeric feature columns from train.jsonl
-    - Compute train-only mean/std and apply to all splits
+    - Auto-detect numeric base features from train.jsonl
+    - Compute train-only mean/std for base features
+    - Append per-sample sequence statistical features
     - Provide PyTorch DataLoaders
     """
 
@@ -125,26 +174,28 @@ class GRNDataModule:
         self.persistent_workers = persistent_workers and num_workers > 0
         self.drop_last = drop_last
 
-        self.feature_names: List[str] = []
+        self.base_feature_names: List[str] = []
+        self.seq_feature_names: List[str] = []
         self.scaler: Dict[str, Dict[str, float]] = {}
 
         self.ds_train: Optional[GRNDataset] = None
         self.ds_valid: Optional[GRNDataset] = None
         self.ds_test: Optional[GRNDataset] = None
 
-    # ---------- public API ----------
-
     def setup(self) -> None:
         rows_train = _load_jsonl(self.train_path)
         rows_valid = _load_jsonl(self.valid_path)
         rows_test = _load_jsonl(self.test_path)
 
-        self.feature_names = self._infer_feature_columns(rows_train)
-        self.scaler = self._compute_scaler(rows_train, self.feature_names)
+        self.base_feature_names = self._infer_base_feature_columns(rows_train)
+        self.scaler = self._compute_scaler(rows_train, self.base_feature_names)
 
-        self.ds_train = GRNDataset(rows_train, self.feature_names, self.scaler)
-        self.ds_valid = GRNDataset(rows_valid, self.feature_names, self.scaler)
-        self.ds_test = GRNDataset(rows_test, self.feature_names, self.scaler)
+        # derive names for seq features (fixed order)
+        _, self.seq_feature_names = _seq_stats("ACDEFGHIKLMNPQRSTVWY")  # just to get names
+
+        self.ds_train = GRNDataset(rows_train, self.base_feature_names, self.scaler, self.seq_feature_names)
+        self.ds_valid = GRNDataset(rows_valid, self.base_feature_names, self.scaler, self.seq_feature_names)
+        self.ds_test = GRNDataset(rows_test, self.base_feature_names, self.scaler, self.seq_feature_names)
 
     def train_dataloader(self) -> DataLoader:
         return self._make_loader(self.ds_train, shuffle=self.shuffle_train)
@@ -156,10 +207,10 @@ class GRNDataModule:
         return self._make_loader(self.ds_test, shuffle=False)
 
     def feature_dim(self) -> int:
-        return len(self.feature_names)
+        # base + seq-stats
+        return len(self.base_feature_names) + len(self.seq_feature_names)
 
-    # ---------- helpers ----------
-
+    # helpers
     def _make_loader(self, ds: GRNDataset, shuffle: bool) -> DataLoader:
         assert ds is not None, "Call setup() first."
         return DataLoader(
@@ -172,8 +223,7 @@ class GRNDataModule:
             drop_last=self.drop_last,
         )
 
-    def _infer_feature_columns(self, rows: List[Dict]) -> List[str]:
-        # start from all numeric keys in train set
+    def _infer_base_feature_columns(self, rows: List[Dict]) -> List[str]:
         cand = set()
         for r in rows:
             for k, v in r.items():
@@ -181,7 +231,6 @@ class GRNDataModule:
                     continue
                 if _is_number(v):
                     cand.add(k)
-        # stable order
         cols = sorted(cand)
         if not cols:
             raise ValueError("No numeric feature columns found in train set.")
@@ -200,7 +249,5 @@ class GRNDataModule:
                 continue
             mean = float(np.mean(vals))
             std = float(np.std(vals))
-            if std == 0.0:
-                std = 1.0
-            stats[c] = {"mean": mean, "std": std}
+            stats[c] = {"mean": mean, "std": (std if std != 0.0 else 1.0)}
         return stats
