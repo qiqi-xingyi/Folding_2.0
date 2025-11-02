@@ -1,17 +1,20 @@
-# --*-- conding:utf-8 --*--
-# @time:11/1/25 03:53
+# --*-- coding:utf-8 --*--
+# @time: 11/01/25 03:53
 # @Author : Yuqi Zhang
-# @Email : yzhan135@kent.edu
-# @File:train.py
+# @File   : train.py
+#
+# GRN training script:
+# - Device selection (CUDA/MPS/CPU) happens before data/model build
+# - RankNet + CE multitask training
+# - Mixed early-stop monitor (alpha * NDCG@10 + (1 - alpha) * Spearman)
+# - Per-epoch CSV/JSON logs + optional dumps of predictions for plotting
 
-# scripts/train.py
 import argparse
-import os
 import csv
 import json
 import random
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
 import numpy as np
 import torch
@@ -24,6 +27,10 @@ from GRN.metrics import summarize_classification, summarize_ranking
 from GRN.losses import build_pairs, ranknet_loss
 
 
+# -------------------------------
+# utils
+# -------------------------------
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -32,6 +39,30 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
+def pick_device(arg_device: str | None):
+    """Pick device by precedence: user arg -> CUDA -> MPS -> CPU."""
+    if arg_device and arg_device != "auto":
+        return torch.device(arg_device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():  # Apple Silicon
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def append_csv_row(csv_path: Path, row: Dict[str, float], header_written: bool):
+    fieldnames = list(row.keys())
+    with csv_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not header_written:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+# -------------------------------
+# eval / train
+# -------------------------------
 
 @torch.no_grad()
 def evaluate(model: nn.Module, loader, device: torch.device, return_details: bool = False):
@@ -117,25 +148,20 @@ def compute_class_weight(train_ds) -> torch.Tensor:
     return torch.tensor(w, dtype=torch.float32)
 
 
-def append_csv_row(csv_path: Path, row: Dict[str, float], header_written: bool):
-    fieldnames = list(row.keys())
-    with csv_path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not header_written:
-            writer.writeheader()
-        writer.writerow(row)
-
+# -------------------------------
+# main
+# -------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default="training_dataset")
-    parser.add_argument("--epochs", type=int, default=100)  # allow longer training
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=3e-4)
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="auto")  # "auto", "cuda", "cuda:0", "cpu", "mps"
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--no_early_stop", action="store_true", default=False)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
@@ -144,27 +170,41 @@ def main():
     parser.add_argument("--lambda_ce", type=float, default=0.33)
     parser.add_argument("--max_pairs_per_group", type=int, default=128)
     parser.add_argument("--use_rank_head", action="store_true", default=True)
-    parser.add_argument("--monitor_alpha", type=float, default=0.5, help="weight for NDCG in early-stop mix metric")
+    parser.add_argument("--monitor_alpha", type=float, default=0.5,
+                        help="weight for NDCG in early-stop mixed metric")
     parser.add_argument("--dump_predictions", action="store_true", default=False,
                         help="save validation/test predictions arrays for plotting")
     args = parser.parse_args()
 
+    # seed
     set_seed(args.seed)
-    device = torch.device(args.device)
+
+    # device selection BEFORE building data/model
+    device = pick_device(args.device)
+    if device.type == "cuda":
+        print(f"[Device] Using GPU: {torch.cuda.get_device_name(0)} (build CUDA {torch.version.cuda})")
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+    elif device.type == "mps":
+        print("[Device] Using Apple MPS backend")
+    else:
+        print(f"[Device] Using CPU")
+
+    # I/O
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
-
-    # set up log files
     csv_log = save_dir / "train_log.csv"
     json_log = save_dir / "train_log.json"
     header_written = csv_log.exists()
-    history = []  # will also be saved to JSON
+    history = []
 
-    # Data
+    # data
     dm = GRNDataModule(data_dir=args.data_dir, batch_size=args.batch_size)
     dm.setup()
 
-    # Model
+    # model
     model = build_grn_from_datamodule(
         dm,
         dropout=args.dropout,
@@ -173,17 +213,19 @@ def main():
     )
     model.to(device)
 
-    # Optimizer / Loss
+    # optim / loss
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     class_weight = compute_class_weight(dm.ds_train).to(device)
     ce_loss = nn.CrossEntropyLoss(weight=class_weight)
 
+    # early stop and checkpoints
     best_monitor = -1.0
     best_epoch = -1
     patience_left = args.patience
     ckpt_best = save_dir / "grn_best.pt"
     ckpt_last = save_dir / "grn_last.pt"
 
+    # training loop
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(
             model, dm.train_dataloader(), optimizer, device,
@@ -198,7 +240,7 @@ def main():
               f"val_acc={val_metrics['acc']:.4f} | val_ndcg@10={val_metrics['ndcg@10']:.4f} | "
               f"val_spearman={val_metrics['spearman']:.4f} | monitor={mixed_monitor:.4f}")
 
-        # append to CSV and JSON history
+        # log to CSV/JSON
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
@@ -238,19 +280,19 @@ def main():
         else:
             patience_left -= 1
 
-        # always save last checkpoint (for resuming or debugging)
+        # always save last checkpoint
         torch.save({
             "epoch": epoch,
             "model_state": model.state_dict(),
             "args": vars(args),
         }, ckpt_last)
 
-        # early stopping (can be disabled)
+        # early stopping
         if not args.no_early_stop and patience_left <= 0:
             print(f"Early stopping at epoch {epoch}. Best epoch {best_epoch} (monitor={best_monitor:.4f}).")
             break
 
-    # Final evaluation with best checkpoint
+    # final test with best checkpoint
     if ckpt_best.exists():
         ckpt = torch.load(ckpt_best, map_location=device)
         model.load_state_dict(ckpt["model_state"])
@@ -259,43 +301,15 @@ def main():
               f"ndcg@5={test_metrics['ndcg@5']:.4f} | ndcg@10={test_metrics['ndcg@10']:.4f} | "
               f"ndcg@20={test_metrics['ndcg@20']:.4f} | spearman={test_metrics['spearman']:.4f}")
 
-        # optional: dump predictions for plotting/analysis
         if args.dump_predictions:
             out_val_path = save_dir / "val_predictions.npz"
             out_test_path = save_dir / "test_predictions.npz"
-
-            # recompute validation with details
             val_metrics, val_details = evaluate(model, dm.valid_dataloader(), device, return_details=True)
             np.savez_compressed(out_val_path, **val_details, **{"metrics": val_metrics})
             np.savez_compressed(out_test_path, **test_details, **{"metrics": test_metrics})
             print(f"[SAVED] {out_val_path} and {out_test_path}")
     else:
         print("No best checkpoint found; skip final test.")
-
-    # --- Device selection ---
-    if not hasattr(args, "device") or args.device is None:
-        args.device = "auto"
-
-    if args.device == "auto":
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
-    else:
-        device = torch.device(args.device)
-
-    # --- Print device info ---
-    if device.type == "cuda":
-        print(f"[Device] Using GPU: {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda})")
-    elif device.type == "mps":
-        print("[Device] Using Apple MPS backend")
-    else:
-        print("[Device] Using CPU")
-
-    # Then later
-    model.to(device)
 
 
 if __name__ == "__main__":
