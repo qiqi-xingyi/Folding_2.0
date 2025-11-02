@@ -272,6 +272,31 @@ def main():
     else:
         print("No best checkpoint found; skip final test.")
 
+    # --- Device selection ---
+    if not hasattr(args, "device") or args.device is None:
+        args.device = "auto"
+
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+
+    # --- Print device info ---
+    if device.type == "cuda":
+        print(f"[Device] Using GPU: {torch.cuda.get_device_name(0)} (CUDA {torch.version.cuda})")
+    elif device.type == "mps":
+        print("[Device] Using Apple MPS backend")
+    else:
+        print("[Device] Using CPU")
+
+    # Then later
+    model.to(device)
+
 
 if __name__ == "__main__":
     main()
