@@ -5,26 +5,78 @@
 # @File:post_process.py
 
 # process_all.py
-# Batch runner: iterate all subfolders under ./quantum_data and run the QSAD post-processing.
-# Results go to ./pp_result/<pdbid>; an aggregate summary.csv/jsonl is produced at the end.
+# Batch runner: iterate through subfolders under ./quantum_data and run the QSAD pipeline.
+# Results are saved to ./pp_result/<pdbid>; summary.csv/jsonl are generated at the end.
 
 import os
 import json
 import csv
 import traceback
+import shutil
+import glob
+from pathlib import Path
 from typing import List, Dict, Any
 
 from qsadpp.orchestrator import OrchestratorConfig, PipelineOrchestrator
 from qsadpp.io_reader import ReaderOptions
 from qsadpp.feature_calculator import FeatureConfig
 
-BASE_DIR = "./quantum_data"
-OUT_ROOT = "./pp_result"
+BASE_DIR = Path("./quantum_data")
+OUT_ROOT = Path("./pp_result")
+STAGING_ROOT = OUT_ROOT / "_staging"
 
-# ---- Orchestrator defaults you provided ----
-def make_cfg(pdb_dir: str, out_dir: str) -> OrchestratorConfig:
+INCLUDE_PATTERNS = [
+    "samples_*.csv",
+    "*.jsonl",
+    "*.pdb",
+    "*.pdb.gz",
+]
+
+EXCLUDE_PATTERNS = [
+    "*timing*.csv",
+]
+
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def discover_targets(base_dir: Path) -> List[Path]:
+    return sorted([p for p in base_dir.iterdir() if p.is_dir()])
+
+
+def _match_any(name: str, patterns: List[str]) -> bool:
+    return any(glob.fnmatch.fnmatch(name, pat) for pat in patterns)
+
+
+def stage_input(src_dir: Path, staging_dir: Path, use_symlink: bool = True) -> None:
+    """
+    Copy or symlink only the files matching INCLUDE_PATTERNS
+    while skipping those matching EXCLUDE_PATTERNS.
+    """
+    ensure_dir(staging_dir)
+    for f in sorted(src_dir.iterdir()):
+        if not f.is_file():
+            continue
+        if _match_any(f.name, EXCLUDE_PATTERNS):
+            continue
+        if not _match_any(f.name, INCLUDE_PATTERNS):
+            continue
+        dst = staging_dir / f.name
+        try:
+            if use_symlink:
+                if dst.exists() or dst.is_symlink():
+                    dst.unlink()
+                dst.symlink_to(f.resolve())
+            else:
+                shutil.copy2(f, dst)
+        except Exception:
+            shutil.copy2(f, dst)
+
+
+def make_cfg(pdb_dir: Path, out_dir: Path) -> OrchestratorConfig:
     return OrchestratorConfig(
-        pdb_dir=pdb_dir,
+        pdb_dir=str(pdb_dir),
         reader_options=ReaderOptions(
             chunksize=100_000,
             strict=True,
@@ -32,7 +84,7 @@ def make_cfg(pdb_dir: str, out_dir: str) -> OrchestratorConfig:
             include_all_csv=False,
         ),
         fifth_bit=False,
-        out_dir=out_dir,
+        out_dir=str(out_dir),
         compute_features=True,
         feature_from="decoded",
         combined_feature_name="features.jsonl",
@@ -41,68 +93,62 @@ def make_cfg(pdb_dir: str, out_dir: str) -> OrchestratorConfig:
         ),
     )
 
-def discover_targets(base_dir: str) -> List[str]:
-    items = []
-    for name in sorted(os.listdir(base_dir)):
-        path = os.path.join(base_dir, name)
-        if os.path.isdir(path):
-            items.append(path)
-    return items
 
-def ensure_dir(p: str) -> None:
-    os.makedirs(p, exist_ok=True)
-
-def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+def write_jsonl(path: Path, rows: List[Dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+
+def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     if not rows:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            f.write("pdb_id,status,message\n")
+        path.write_text("pdb_id,status,message\n", encoding="utf-8")
         return
     fieldnames = sorted({k for r in rows for k in r.keys()})
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(rows)
 
+
 def main():
     ensure_dir(OUT_ROOT)
+    ensure_dir(STAGING_ROOT)
+
     targets = discover_targets(BASE_DIR)
     if not targets:
-        print(f"[WARN] No subfolders found under {BASE_DIR}")
+        print(f"[WARN] No subfolders under {BASE_DIR}")
         return
 
     aggregate: List[Dict[str, Any]] = []
 
     for pdb_path in targets:
-        pdb_id = os.path.basename(pdb_path.rstrip("/"))
-        out_dir = os.path.join(OUT_ROOT, pdb_id)
+        pdb_id = pdb_path.name
+        out_dir = OUT_ROOT / pdb_id
+        staging_dir = STAGING_ROOT / pdb_id
         ensure_dir(out_dir)
 
         print(f"==> Processing {pdb_id}")
         try:
-            cfg = make_cfg(pdb_path, out_dir)
-            runner = PipelineOrchestrator(cfg)
-            summary = runner.run()  # expected to be dict-like
-            print(f"[OK] {pdb_id}")
+            # Prepare a temporary folder excluding timing files
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
+            stage_input(pdb_path, staging_dir, use_symlink=True)
 
-            row = {
-                "pdb_id": pdb_id,
-                "status": "ok",
-                "out_dir": out_dir,
-            }
+            # Run orchestrator
+            cfg = make_cfg(staging_dir, out_dir)
+            runner = PipelineOrchestrator(cfg)
+            summary = runner.run()
+
+            print(f"[OK] {pdb_id}")
+            row = {"pdb_id": pdb_id, "status": "ok", "out_dir": str(out_dir)}
             if isinstance(summary, dict):
-                # Flatten a few common keys if present
                 for k in ("num_decoded", "num_energy", "num_feature", "time_sec"):
                     if k in summary:
                         row[k] = summary[k]
             aggregate.append(row)
 
-            # Also drop a per-target summary.json
-            with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+            with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
                 json.dump(summary if isinstance(summary, dict) else {"summary": str(summary)},
                           f, ensure_ascii=False, indent=2)
 
@@ -112,16 +158,15 @@ def main():
                 "pdb_id": pdb_id,
                 "status": "fail",
                 "message": str(e),
-                "out_dir": out_dir,
+                "out_dir": str(out_dir),
             })
-            # Keep a traceback file for debugging
-            with open(os.path.join(out_dir, "error.log"), "w", encoding="utf-8") as f:
+            with (out_dir / "error.log").open("w", encoding="utf-8") as f:
                 f.write("".join(traceback.format_exc()))
 
-    # Write aggregate reports
-    write_csv(os.path.join(OUT_ROOT, "summary.csv"), aggregate)
-    write_jsonl(os.path.join(OUT_ROOT, "summary.jsonl"), aggregate)
-    print(f"\nAll done. Summary written to {OUT_ROOT}/summary.csv and summary.jsonl")
+    write_csv(OUT_ROOT / "summary.csv", aggregate)
+    write_jsonl(OUT_ROOT / "summary.jsonl", aggregate)
+    print(f"\nAll done. Summary at {OUT_ROOT}/summary.csv & summary.jsonl")
+
 
 if __name__ == "__main__":
     main()
