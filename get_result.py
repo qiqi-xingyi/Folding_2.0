@@ -178,7 +178,7 @@ def main():
         summary.append(rep)
 
     # save summary
-    summary_path = os.path.join(args.out_dir, "summary.csv")
+    summary_path = os.path.join(args.out_dir, "qsad_rmsd_summary.csv")
     pd.DataFrame(summary).to_csv(summary_path, index=False)
     LOG.info("Wrote summary to %s", summary_path)
 

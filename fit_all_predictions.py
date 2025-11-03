@@ -450,7 +450,7 @@ def main():
             })
 
     df = pd.DataFrame(rows)
-    df.to_csv(os.path.join(args.out_dir, "summary.csv"), index=False)
+    df.to_csv(os.path.join(args.out_dir, "qsad_rmsd_summary.csv"), index=False)
     print(df)
 
 

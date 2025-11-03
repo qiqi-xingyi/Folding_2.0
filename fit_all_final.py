@@ -9,7 +9,7 @@
 #   - No fallback
 #   - Top-K iterative refinement (K=10→3) with RMSD-weighted passes
 #   - Final nudging of refined_ca toward native by fraction (--nudging_eta)
-#   - Output: one folder per target + summary.csv with [pdb_id, sequence, final_rmsd]
+#   - Output: one folder per target + qsad_rmsd_summary.csv with [pdb_id, sequence, final_rmsd]
 
 import argparse, glob, json, math, os
 import numpy as np, pandas as pd
@@ -166,7 +166,7 @@ def main():
     for fp in sorted(glob.glob(os.path.join(a.pred_dir,"*_top50.json"))):
         try: rows.append(process_one(fp,bench,a.dataset_dir,a.out_dir,a.mode,a.stop,a.polish,a.nudging_eta))
         except Exception as e: rows.append({"pdb_id":os.path.basename(fp).split("_top50.json")[0],"sequence":"ERR","final_rmsd":math.nan})
-    pd.DataFrame(rows)[["pdb_id","sequence","final_rmsd"]].to_csv(os.path.join(a.out_dir,"summary.csv"),index=False)
+    pd.DataFrame(rows)[["pdb_id","sequence","final_rmsd"]].to_csv(os.path.join(a.out_dir,"qsad_rmsd_summary.csv"),index=False)
     print("Done. Results saved to",a.out_dir)
 
 if __name__=="__main__": main()

@@ -6,7 +6,7 @@
 
 # process_all.py
 # Batch runner: iterate through subfolders under ./quantum_data and run the QSAD pipeline.
-# Results are saved to ./pp_result/<pdbid>; summary.csv/jsonl are generated at the end.
+# Results are saved to ./pp_result/<pdbid>; qsad_rmsd_summary.csv/jsonl are generated at the end.
 
 import os
 import json
@@ -163,9 +163,9 @@ def main():
             with (out_dir / "error.log").open("w", encoding="utf-8") as f:
                 f.write("".join(traceback.format_exc()))
 
-    write_csv(OUT_ROOT / "summary.csv", aggregate)
+    write_csv(OUT_ROOT / "qsad_rmsd_summary.csv", aggregate)
     write_jsonl(OUT_ROOT / "summary.jsonl", aggregate)
-    print(f"\nAll done. Summary at {OUT_ROOT}/summary.csv & summary.jsonl")
+    print(f"\nAll done. Summary at {OUT_ROOT}/qsad_rmsd_summary.csv & summary.jsonl")
 
 
 if __name__ == "__main__":
