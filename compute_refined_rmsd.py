@@ -3,256 +3,251 @@
 # @Author : Yuqi Zhang
 # @Email : yzhan135@kent.edu
 # @File:compute_refined_rmsd.py
-#
-# Compute RMSD for each test_output/<pdb_id>/refined_ca.pdb against reference CA
-# defined by dataset/benchmark_info.txt (residue span) and PDBbind pocket/protein.
-# Picks the best-matching reference chain and aligns with Kabsch. Writes a single CSV.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import argparse
-import csv
-from pathlib import Path
-from typing import Dict, Any, Iterable, List, Tuple, Optional
+"""
+Plot RMSD comparisons across QSAD, VQE, AF3, and ColabFold.
+Only bar charts use custom fixed colors with outlines.
+"""
+
+import os
+from typing import Dict, Tuple, List
 
 import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
-# ---------- IO utils ----------
 
-def read_benchmark_info(path: Path) -> Dict[str, Dict[str, Any]]:
-    idx: Dict[str, Dict[str, Any]] = {}
-    with path.open("r", encoding="utf-8") as f:
-        header = None
+# ----------------------------
+# File paths
+# ----------------------------
+AF3_TXT = "output_final/af3_rmsd_summary.txt"
+COLABFOLD_TXT = "output_final/colabfold_rmsd_summary.txt"
+VQE_TXT = "output_final/vqe_rmsd_summary.txt"
+QSAD_CSV = "output_final/qsad_rmsd_summary.csv"
+
+OUT_DIR = "final_fig"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+plt.rcParams["figure.dpi"] = 140
+plt.rcParams["savefig.dpi"] = 300
+plt.rcParams["font.size"] = 10
+plt.rcParams["axes.grid"] = True
+
+# ----------------------------
+# Custom bar colors
+# ----------------------------
+BAR_COLORS = {
+    "QSAD": "#CCFF00",      # fluorescent yellow-green
+    "AF3": "#5B3A29",       # dark brown
+    "VQE": "#003366",       # deep blue
+    "ColabFold": "#4A4A4A", # dark gray
+}
+EDGE_KW = dict(edgecolor="black", linewidth=0.6)
+
+
+# ----------------------------
+# Helper loaders
+# ----------------------------
+def load_tab_txt(path: str) -> Dict[str, float]:
+    data: Dict[str, float] = {}
+    if not os.path.exists(path):
+        return data
+    with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line:
+            if not line or line.startswith("#") or "\t" not in line:
                 continue
-            if header is None:
-                header = [h.strip() for h in line.split("\t")]
-                continue
-            parts = [p.strip() for p in line.split("\t")]
-            rec = dict(zip(header, parts))
-            pdb = rec["pdb_id"]
-            idx[pdb] = rec
-    return idx
-
-
-def parse_residue_span(span: str) -> Tuple[int, int]:
-    s = span.strip()
-    if "-" not in s:
-        raise ValueError(f"Invalid residue span: {s}")
-    a, b = s.split("-", 1)
-    return int(a), int(b)
-
-
-# ---------- PDB parsing ----------
-
-def load_ca_coords_refined(path: Path) -> np.ndarray:
-    # refined_ca.pdb produced by our pipeline is CA-only with residue indices 1..L
-    if not path.exists():
-        raise FileNotFoundError(f"Missing refined PDB: {path}")
-    ca = []
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if not line.startswith("ATOM"):
-                continue
-            if line[12:16].strip() != "CA":
-                continue
+            pid, val = line.split("\t", 1)
             try:
-                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
-            except ValueError:
-                continue
-            ca.append([x, y, z])
-    if not ca:
-        raise ValueError(f"No CA atoms found in refined PDB: {path}")
-    return np.asarray(ca, dtype=np.float64)
+                data[pid.strip()] = float(val.strip())
+            except Exception:
+                pass
+    return data
 
 
-def load_reference_ca_by_chain(pdb_path: Path, start_res: int, end_res: int) -> Dict[str, np.ndarray]:
-    chains: Dict[str, np.ndarray] = {}
-    if not pdb_path.exists():
-        return chains
-    tmp: Dict[str, List[List[float]]] = {}
-    with pdb_path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if not line.startswith("ATOM"):
-                continue
-            if line[12:16].strip() != "CA":
-                continue
-            chain_id = line[21].strip() or "_"
-            try:
-                resseq = int(line[22:26])
-            except ValueError:
-                continue
-            if resseq < start_res or resseq > end_res:
-                continue
-            try:
-                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
-            except ValueError:
-                continue
-            tmp.setdefault(chain_id, []).append([x, y, z])
-    for c, arr in tmp.items():
-        if arr:
-            chains[c] = np.asarray(arr, dtype=np.float64)
-    return chains
+def load_qsad_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    return df[["pdb_id", "sequence", "final_rmsd"]].copy()
 
 
-# ---------- Geometry ----------
-
-def kabsch_align(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, float]:
-    # Align P to Q; both (N,3)
-    if P.shape != Q.shape or P.shape[1] != 3:
-        raise ValueError("Input shapes must be (N,3) and equal.")
-    Pc = P.mean(axis=0)
-    Qc = Q.mean(axis=0)
-    P0 = P - Pc
-    Q0 = Q - Qc
-    C = P0.T @ Q0
-    V, S, Wt = np.linalg.svd(C)
-    d = np.sign(np.linalg.det(V @ Wt))
-    D = np.diag([1.0, 1.0, d])
-    R = V @ D @ Wt
-    P_rot = P0 @ R
-    P_aligned = P_rot + Qc
-    diff = P_aligned - Q
-    rmsd = np.sqrt(np.mean(np.sum(diff * diff, axis=1)))
-    return P_aligned, float(rmsd)
+def savefig(out_path_base: str):
+    png = f"{out_path_base}.png"
+    pdf = f"{out_path_base}.pdf"
+    plt.tight_layout()
+    plt.savefig(png, bbox_inches="tight")
+    plt.savefig(pdf, bbox_inches="tight")
+    print(f"[saved] {png}\n[saved] {pdf}")
 
 
-# ---------- Discovery ----------
+# ----------------------------
+# Bar charts (custom colors)
+# ----------------------------
+def grouped_bar_all(df: pd.DataFrame, methods: List[str]):
+    plot_df = df.copy()
+    if "QSAD" in plot_df.columns:
+        plot_df = plot_df.sort_values("QSAD", na_position="last")
+    pdbs = plot_df["pdb_id"].tolist()
 
-def discover_refined_targets(out_root: Path) -> List[str]:
-    out = []
-    if not out_root.exists():
-        return out
-    for d in out_root.iterdir():
-        if not d.is_dir():
-            continue
-        pdb_id = d.name
-        if (d / "refined_ca.pdb").exists():
-            out.append(pdb_id)
-    return sorted(out)
+    x = np.arange(len(pdbs))
+    width = max(0.1, min(0.8 / max(1, len(methods)), 0.22))
 
+    fig = plt.figure(figsize=(max(12, 0.35 * len(pdbs)), 6))
+    ax = plt.gca()
 
-# ---------- Main computation ----------
+    for i, meth in enumerate(methods):
+        heights = plot_df[meth].to_numpy() if meth in plot_df.columns else np.full(len(pdbs), np.nan)
+        xpos = x + (i - (len(methods) - 1) / 2) * width
+        for xi, yi in zip(xpos, heights):
+            if pd.notna(yi):
+                ax.bar(
+                    xi, yi, width=width,
+                    color=BAR_COLORS.get(meth, "#999999"),
+                    **EDGE_KW
+                )
 
-def compute_one(pdb_id: str,
-                final_root: Path,
-                pdbbind_root: Path,
-                bench: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    refined_path = final_root / pdb_id / "refined_ca.pdb"
-    try:
-        Q = load_ca_coords_refined(refined_path)
-    except Exception as e:
-        return {"pdb_id": pdb_id, "status": f"refined_load_failed: {e}"}
+    ax.set_xticks(x)
+    ax.set_xticklabels(pdbs, rotation=90)
+    ax.set_ylabel("RMSD (Å)")
+    ax.set_title("RMSD across methods (QSAD set)")
 
-    if pdb_id not in bench:
-        return {"pdb_id": pdb_id, "status": "no_benchmark_entry"}
+    handles = [Patch(facecolor=BAR_COLORS[m], **EDGE_KW) for m in methods]
+    ax.legend(handles, methods, ncols=min(4, len(methods)))
 
-    try:
-        start_res, end_res = parse_residue_span(bench[pdb_id]["Residues"])
-    except Exception as e:
-        return {"pdb_id": pdb_id, "status": f"bad_span: {e}"}
-
-    pocket_p = pdbbind_root / pdb_id / f"{pdb_id}_pocket.pdb"
-    protein_p = pdbbind_root / pdb_id / f"{pdb_id}_protein.pdb"
-
-    ref_src = "pocket"
-    ref_chains = load_reference_ca_by_chain(pocket_p, start_res, end_res)
-    ref_path_used = pocket_p
-    if not ref_chains:
-        ref_chains = load_reference_ca_by_chain(protein_p, start_res, end_res)
-        ref_src = "protein"
-        ref_path_used = protein_p
-    if not ref_chains:
-        return {"pdb_id": pdb_id, "status": "reference_not_found"}
-
-    Lq = Q.shape[0]
-    chain_choices = [(cid, arr.shape[0], arr) for cid, arr in ref_chains.items()]
-    # Prefer closest length to refined; tie-breaker prefers longer chain
-    chain_choices.sort(key=lambda x: (abs(x[1] - Lq), -x[1]))
-    best = None
-
-    for cid, Lref, Pfull in chain_choices:
-        Lc = min(Lq, Lref)
-        if Lc < 3:
-            continue
-        Q_use = Q[:Lc]
-        P_use = Pfull[:Lc]
-        try:
-            _, r = kabsch_align(Q_use, P_use)
-        except Exception:
-            continue
-        if (best is None) or (r < best["rmsd"]):
-            best = {
-                "pdb_id": pdb_id,
-                "ref_source": ref_src,
-                "ref_path": str(ref_path_used),
-                "chain": cid,
-                "L_refined": Lq,
-                "L_ref": Lref,
-                "L_common": Lc,
-                "rmsd": float(r),
-                "refined_path": str(refined_path),
-                "status": "ok",
-            }
-
-    if best is None:
-        return {"pdb_id": pdb_id, "status": "align_failed_or_too_short"}
-
-    return best
+    savefig(os.path.join(OUT_DIR, "bar_all_methods"))
+    plt.close()
 
 
+def improvement_bar(df: pd.DataFrame, other: str, base: str = "QSAD"):
+    if other not in df.columns or base not in df.columns:
+        return
+    sub = df[["pdb_id", base, other]].dropna()
+    if sub.empty:
+        return
+
+    sub = sub.sort_values(base)
+    diff = sub[other] - sub[base]
+
+    fig = plt.figure(figsize=(max(10, 0.25 * len(sub)), 4))
+    ax = plt.gca()
+    ax.bar(
+        sub["pdb_id"],
+        diff,
+        color=BAR_COLORS.get(other, "#999999"),
+        **EDGE_KW
+    )
+    ax.axhline(0, color="k", linewidth=1)
+    ax.set_xticklabels(sub["pdb_id"], rotation=90)
+    ax.set_ylabel(f"{other} - {base} (Å)")
+    ax.set_title(f"Improvement vs {other} (positive means {base} is better)")
+
+    handles = [Patch(facecolor=BAR_COLORS[other], **EDGE_KW)]
+    ax.legend(handles, [other])
+
+    savefig(os.path.join(OUT_DIR, f"improvement_{other.lower()}_vs_{base.lower()}"))
+    plt.close()
+
+
+# ----------------------------
+# Default-style plots
+# ----------------------------
+def scatter_vs_qsad(df: pd.DataFrame, other: str, base: str = "QSAD"):
+    if other not in df.columns or base not in df.columns:
+        return
+    sub = df[[base, other]].dropna()
+    if sub.empty:
+        return
+
+    xmin = float(min(sub[base].min(), sub[other].min()))
+    xmax = float(max(sub[base].max(), sub[other].max()))
+    pad = 0.1 * (xmax - xmin) if xmax > xmin else 0.5
+    lo, hi = xmin - pad, xmax + pad
+
+    plt.figure(figsize=(5, 5))
+    plt.scatter(sub[base], sub[other], s=20)
+    plt.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1, color="black")
+    plt.xlim(lo, hi)
+    plt.ylim(lo, hi)
+    plt.xlabel(f"{base} RMSD (Å)")
+    plt.ylabel(f"{other} RMSD (Å)")
+    plt.title(f"{base} vs {other} RMSD")
+    savefig(os.path.join(OUT_DIR, f"scatter_{base.lower()}_vs_{other.lower()}"))
+    plt.close()
+
+
+def boxplot_by_method(df: pd.DataFrame, methods: List[str]):
+    vals, labels = [], []
+    for m in methods:
+        if m in df.columns and df[m].notna().sum() > 0:
+            vals.append(df[m].dropna().values)
+            labels.append(m)
+    if not vals:
+        return
+    plt.figure(figsize=(1.8 * len(labels), 5))
+    plt.boxplot(vals, labels=labels, showfliers=True, patch_artist=False)
+    plt.ylabel("RMSD (Å)")
+    plt.title("RMSD distribution by method")
+    savefig(os.path.join(OUT_DIR, "boxplot_rmsd_by_method"))
+    plt.close()
+
+
+def ecdf(data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    x = np.sort(data)
+    y = np.arange(1, len(x) + 1) / len(x)
+    return x, y
+
+
+def ecdf_plot(df: pd.DataFrame, methods: List[str]):
+    available = [m for m in methods if m in df.columns and df[m].notna().sum() > 0]
+    if not available:
+        return
+    plt.figure(figsize=(6, 5))
+    for m in available:
+        x, y = ecdf(df[m].dropna().values)
+        plt.plot(x, y, label=m)
+    plt.xlabel("RMSD (Å)")
+    plt.ylabel("ECDF")
+    plt.title("ECDF of RMSD by method")
+    plt.legend()
+    savefig(os.path.join(OUT_DIR, "ecdf_rmsd_by_method"))
+    plt.close()
+
+
+# ----------------------------
+# Main
+# ----------------------------
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--final_root", type=str, default="test_output", help="Directory with per-PDB refined_ca.pdb")
-    ap.add_argument("--dataset_root", type=str, default="dataset", help="Dataset root containing Pdbbind/")
-    ap.add_argument("--bench_info", type=str, default="dataset/benchmark_info.txt", help="Benchmark index with residue spans")
-    ap.add_argument("--only", type=str, default="", help="Comma-separated pdb_ids to restrict processing, e.g. '1e2k,4f5y'")
-    ap.add_argument("--out_csv", type=str, default="test_rmsd_summary.csv", help="Output CSV path")
-    args = ap.parse_args()
+    af3 = load_tab_txt(AF3_TXT)
+    colab = load_tab_txt(COLABFOLD_TXT)
+    vqe = load_tab_txt(VQE_TXT)
+    qsad_df = load_qsad_csv(QSAD_CSV)
 
-    final_root = Path(args.final_root)
-    pdbbind_root = Path(args.dataset_root) / "Pdbbind"
-    bench = read_benchmark_info(Path(args.bench_info))
+    merged = qsad_df.rename(columns={"final_rmsd": "QSAD"}).copy()
+    merged["AF3"] = merged["pdb_id"].map(af3).astype(float)
+    merged["ColabFold"] = merged["pdb_id"].map(colab).astype(float)
+    merged["VQE"] = merged["pdb_id"].map(vqe).astype(float)
 
-    pdb_ids = discover_refined_targets(final_root)
-    if args.only.strip():
-        allow = {p.strip().lower() for p in args.only.split(",") if p.strip()}
-        pdb_ids = [p for p in pdb_ids if p.lower() in allow]
+    merged_out = os.path.join(OUT_DIR, "merged_rmsd.csv")
+    merged.to_csv(merged_out, index=False)
+    print(f"[saved] {merged_out}")
 
-    rows: List[Dict[str, Any]] = []
-    for pdb_id in pdb_ids:
-        rec = compute_one(pdb_id, final_root, pdbbind_root, bench)
-        if rec is None:
-            continue
-        rows.append(rec)
+    methods = ["QSAD", "VQE", "AF3", "ColabFold"]
 
-    # Write CSV
-    out_path = Path(args.out_csv)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "pdb_id", "status", "rmsd",
-        "L_refined", "L_ref", "L_common",
-        "ref_source", "chain",
-        "refined_path", "ref_path"
-    ]
-    with out_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow({
-                "pdb_id": r.get("pdb_id", ""),
-                "status": r.get("status", ""),
-                "rmsd": f'{r.get("rmsd"):.4f}' if isinstance(r.get("rmsd"), (int, float)) else "",
-                "L_refined": r.get("L_refined", ""),
-                "L_ref": r.get("L_ref", ""),
-                "L_common": r.get("L_common", ""),
-                "ref_source": r.get("ref_source", ""),
-                "chain": r.get("chain", ""),
-                "refined_path": r.get("refined_path", ""),
-                "ref_path": r.get("ref_path", ""),
-            })
+    # custom-colored bar charts
+    grouped_bar_all(merged, methods)
+    for other in ["AF3", "ColabFold", "VQE"]:
+        improvement_bar(merged, other, base="QSAD")
 
-    print(f"[DONE] Wrote {len(rows)} rows to {out_path.resolve()}")
+    # other plots keep default style
+    for other in ["AF3", "ColabFold", "VQE"]:
+        scatter_vs_qsad(merged, other, base="QSAD")
+
+    boxplot_by_method(merged, methods)
+    ecdf_plot(merged, methods)
+
+    print("[done] All figures saved to:", OUT_DIR)
 
 
 if __name__ == "__main__":
