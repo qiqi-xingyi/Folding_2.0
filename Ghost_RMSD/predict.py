@@ -80,21 +80,73 @@ def seq_features_from_sequence(seq: str, feature_names: List[str]) -> Dict[str, 
     return feats
 
 
-def rebuild_scaler_if_needed(scaler_obj: Any) -> Any:
+def _make_identity_scaler(expected_dim: int):
+    class _Id:
+        def __init__(self, dim): self.n_features_in_ = dim
+        def transform(self, X): return X
+    return _Id(expected_dim)
+
+def rebuild_scaler_if_needed(scaler_obj: Any, expected_dim: int) -> Any:
+    """
+    Accepts:
+      - sklearn-like object with .transform
+      - dict with any of:
+          mean_/scale_, mean/std, state:{mean_, scale_}, center/scale
+      - "identity"/None   -> identity scaler
+    Fallback to identity scaler if nothing matches (with a warning).
+    """
+    # 1) already a transformer
     if hasattr(scaler_obj, "transform"):
         return scaler_obj
-    if isinstance(scaler_obj, dict) and "mean_" in scaler_obj and "scale_" in scaler_obj:
-        from sklearn.preprocessing import StandardScaler
-        s = StandardScaler()
-        s.mean_ = np.asarray(scaler_obj["mean_"], dtype=float)
-        s.scale_ = np.asarray(scaler_obj["scale_"], dtype=float)
-        s.var_ = s.scale_ ** 2
-        s.n_features_in_ = int(s.mean_.shape[0])
-        return s
-    raise ValueError(
-        "Invalid 'scaler' in checkpoint: expected sklearn-like object with .transform "
-        "or a dict containing mean_ and scale_."
-    )
+
+    # 2) explicit identity / none
+    if scaler_obj is None or (isinstance(scaler_obj, str) and scaler_obj.lower() in {"identity", "none", "null"}):
+        return _make_identity_scaler(expected_dim)
+
+    # 3) dict-like formats
+    if isinstance(scaler_obj, dict):
+        d = scaler_obj
+
+        # nested state
+        if "state" in d and isinstance(d["state"], dict):
+            d = d["state"]
+
+        # try common key variants
+        def _arr(key):
+            v = d.get(key, None)
+            if v is None: return None
+            return np.asarray(v, dtype=float)
+
+        mean = _arr("mean_") or _arr("mean") or _arr("center_") or _arr("center")
+        scale = _arr("scale_") or _arr("scale") or _arr("std") or _arr("std_")
+
+        if mean is not None and scale is not None:
+            # rebuild StandardScaler if可用，否则构造轻量transformer
+            try:
+                from sklearn.preprocessing import StandardScaler
+                s = StandardScaler()
+                s.mean_ = mean
+                s.scale_ = scale
+                s.var_ = (scale ** 2)
+                s.n_features_in_ = int(mean.shape[0])
+                return s
+            except Exception:
+                class _Lite:
+                    def __init__(self, mean, scale):
+                        self.mean_ = mean
+                        self.scale_ = np.where(scale == 0, 1.0, scale)
+                        self.n_features_in_ = int(mean.shape[0])
+                    def transform(self, X):
+                        return (X - self.mean_) / self.scale_
+                return _Lite(mean, scale)
+
+        feat_names = d.get("feature_names_", None)
+        if isinstance(feat_names, (list, tuple)) and len(feat_names) == expected_dim:
+            return _make_identity_scaler(expected_dim)
+
+    # 4) ultimate fallback: identity
+    print("[WARN] 'scaler' in checkpoint is unrecognized; using identity transform.")
+    return _make_identity_scaler(expected_dim)
 
 
 def ensure_base_features(df: pd.DataFrame, base_feature_names: List[str]) -> pd.DataFrame:
@@ -230,7 +282,7 @@ def main():
 
     base_feature_names: List[str] = ckpt["base_feature_names"]
     seq_feature_names: List[str] = ckpt["seq_feature_names"]
-    scaler = rebuild_scaler_if_needed(ckpt["scaler"])
+    scaler = rebuild_scaler_if_needed(ckpt.get("scaler", None), expected_dim=len(base_feature_names))
 
     df = load_jsonl(Path(args.input_jsonl))
     for c in ["pdb_id", "sequence", "bitstring"]:
