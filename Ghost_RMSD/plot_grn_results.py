@@ -1,18 +1,8 @@
-# --*-- conding:utf-8 --*--
-# @time:11/2/25 13:46
-# @Author : Yuqi Zhang
-# @Email : yzhan135@kent.edu
-# @File:plot_grn_results.py
-
-# --*-- coding:utf-8 --*--
-# @time: 11/2/25
-# @Author : Yuqi Zhang
-# @File   : plot_grn_results.py
-#
+# plot_grn_results.py
 # Standalone visualization script for GRN training and prediction results.
 # Generates:
-#   - Training curves (loss, acc, ndcg, spearman, monitor)
-#   - Validation/test score–RMSD scatter plots
+#   - Training curves (loss, acc, ndcg, spearman, monitor) for first 500 epochs
+#   - Validation/test score–normalized-RMSD scatter plots (per-group min-max normalization)
 # All figures are saved under checkpoints_full/figs/
 
 import os
@@ -28,6 +18,7 @@ VAL_NPZ = BASE_DIR / "checkpoints_full/val_predictions.npz"
 TEST_NPZ = BASE_DIR / "checkpoints_full/test_predictions.npz"
 OUT_DIR = BASE_DIR / "checkpoints_full/figs"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+EPOCH_LIMIT = 500
 # =================================
 
 
@@ -89,7 +80,10 @@ def scatter_with_fit(x, y, title, xlabel, ylabel, out_path: Path):
     plt.close()
 
 
-def plot_training_curves(rows, out_dir: Path):
+def plot_training_curves(rows, out_dir: Path, epoch_limit: int = 500):
+    # trim to first `epoch_limit` epochs by index order
+    rows = rows[:epoch_limit] if len(rows) > epoch_limit else rows
+
     epochs = np.array([r["epoch"] for r in rows])
     train_loss = np.array([r["train_loss"] for r in rows])
     val_acc = np.array([r["val_acc"] for r in rows])
@@ -104,7 +98,7 @@ def plot_training_curves(rows, out_dir: Path):
     plt.plot(epochs, train_loss, label="train_loss")
     plt.xlabel("epoch")
     plt.ylabel("loss")
-    plt.title("Training Loss")
+    plt.title("Training Loss (first 500 epochs)")
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_dir / "loss.png", dpi=200)
@@ -115,7 +109,7 @@ def plot_training_curves(rows, out_dir: Path):
     plt.plot(epochs, val_acc, label="val_acc", color="orange")
     plt.xlabel("epoch")
     plt.ylabel("accuracy")
-    plt.title("Validation Accuracy")
+    plt.title("Validation Accuracy (first 500 epochs)")
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_dir / "val_acc.png", dpi=200)
@@ -129,7 +123,7 @@ def plot_training_curves(rows, out_dir: Path):
     plt.plot(epochs, spearman, label="spearman")
     plt.xlabel("epoch")
     plt.ylabel("metric")
-    plt.title("Ranking Metrics")
+    plt.title("Ranking Metrics (first 500 epochs)")
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
@@ -141,11 +135,25 @@ def plot_training_curves(rows, out_dir: Path):
     plt.plot(epochs, monitor, label="monitor", color="green")
     plt.xlabel("epoch")
     plt.ylabel("monitor")
-    plt.title("Mixed Monitor")
+    plt.title("Mixed Monitor (first 500 epochs)")
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_dir / "monitor.png", dpi=200)
     plt.close()
+
+
+def normalize_rmsd_per_group(rmsd: np.ndarray, groups: np.ndarray) -> np.ndarray:
+    """Min-max normalize RMSD within each group to [0,1]."""
+    rmsd = rmsd.astype(float).copy()
+    out = np.empty_like(rmsd, dtype=float)
+    uniq = np.unique(groups)
+    for g in uniq:
+        idx = (groups == g)
+        r = rmsd[idx]
+        rmin = float(np.min(r))
+        rmax = float(np.max(r))
+        out[idx] = (r - rmin) / (rmax - rmin + 1e-12)
+    return out
 
 
 def plot_prediction_scatter(npz_path: Path, tag: str, out_dir: Path):
@@ -155,12 +163,20 @@ def plot_prediction_scatter(npz_path: Path, tag: str, out_dir: Path):
     data = np.load(npz_path, allow_pickle=True)
     scores = data["scores"].astype(float).ravel()
     rmsd = data["rmsd"].astype(float).ravel()
+    groups = data.get("groups", None)
+    if groups is None:
+        print(f"[WARN] `{tag}` predictions missing `groups`; skip normalization.")
+        norm_rmsd = rmsd
+    else:
+        groups = groups.astype(int).ravel()
+        norm_rmsd = normalize_rmsd_per_group(rmsd, groups)
+
     scatter_with_fit(
         x=scores,
-        y=rmsd,
-        title=f"{tag} set: Predicted score vs RMSD (lower is better)",
+        y=norm_rmsd,
+        title=f"{tag} set: Predicted score vs Normalized RMSD (per-group)",
         xlabel="Predicted score (higher is better)",
-        ylabel="RMSD (Å)",
+        ylabel="Normalized RMSD (per group)",
         out_path=out_dir / f"{tag.lower()}_score_vs_rmsd.png",
     )
 
@@ -168,7 +184,7 @@ def plot_prediction_scatter(npz_path: Path, tag: str, out_dir: Path):
 def main():
     print("=== GRN Visualization ===")
     rows = read_train_log_csv(LOG_CSV)
-    plot_training_curves(rows, OUT_DIR)
+    plot_training_curves(rows, OUT_DIR, epoch_limit=EPOCH_LIMIT)
     plot_prediction_scatter(VAL_NPZ, "Validation", OUT_DIR)
     plot_prediction_scatter(TEST_NPZ, "Test", OUT_DIR)
     print(f"[DONE] All figures saved to: {OUT_DIR.resolve()}")
