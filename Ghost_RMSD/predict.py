@@ -14,7 +14,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-from GRN.model import GRN
+from GRN.model import GRNClassifier
 
 
 AA_ORDER = list("ACDEFGHIKLMNPQRSTVWY")  # 20 standard residues
@@ -100,10 +100,9 @@ def build_model_from_ckpt(
     dropout: float = 0.3,
 ) -> nn.Module:
     # Build GRN model with the same architecture signature used during training.
-    model = GRN(
+    model = GRNClassifier(
         in_dim=input_dim,
         hidden_dims=[512, 256, 128],
-        num_classes=num_classes,
         dropout=dropout,
         use_rank_head=True,
     )
