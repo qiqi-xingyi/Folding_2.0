@@ -4,13 +4,12 @@
 # @Email : yzhan135@kent.edu
 # @File:batch_predict.py
 
-# --*-- coding:utf-8 --*--
-# @time:11/2/25 23:05
-# @Author : Yuqi Zhang
-# @Email : yzhan135@kent.edu
-# @File:batch_predict.py
 #
 # Batch runner for Ghost_RMSD/predict.py over prepared_dataset/*_grn_input.jsonl
+
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 
 import argparse
 import csv
