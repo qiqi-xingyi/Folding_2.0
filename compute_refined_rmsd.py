@@ -207,7 +207,7 @@ def main():
     ap.add_argument("--dataset_root", type=str, default="dataset", help="Dataset root containing Pdbbind/")
     ap.add_argument("--bench_info", type=str, default="dataset/benchmark_info.txt", help="Benchmark index with residue spans")
     ap.add_argument("--only", type=str, default="", help="Comma-separated pdb_ids to restrict processing, e.g. '1e2k,4f5y'")
-    ap.add_argument("--out_csv", type=str, default="final_rmsd_summary.csv", help="Output CSV path")
+    ap.add_argument("--out_csv", type=str, default="test_rmsd_summary.csv", help="Output CSV path")
     args = ap.parse_args()
 
     final_root = Path(args.final_root)
