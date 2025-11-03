@@ -5,29 +5,6 @@
 # @File:rmsd_all.py
 
 
-"""
-find_best_rmsd.py
-
-Scan a JSON or CSV file of decoded structures, compute CA-aligned RMSD to the
-ground-truth segment, and select the best candidate.
-
-Examples:
-  python find_best_rmsd.py \
-    --pdb-id 1m7y \
-    --index dataset/benchmark_info.txt \
-    --data-root dataset/Pdbbind \
-    --json decoded_structs.json \
-    --out-dir e_results/1m7y/best_from_json
-
-  python find_best_rmsd.py \
-    --pdb-id 1m7y \
-    --index dataset/benchmark_info.txt \
-    --data-root dataset/Pdbbind \
-    --csv cluster_results.csv \
-    --pos-col main_positions \
-    --out-dir e_results/1m7y/best_from_csv
-"""
-
 import os
 import sys
 import json
