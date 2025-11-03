@@ -130,7 +130,7 @@ def process_one_csv(csv_path: str, out_root: str, top_k: int, refine_mode: str) 
     # match RMSDs to decoded rows 1:1 in order (top set preserved)
     rmsd_used = df_top["rmsd"].iloc[:len(decoded)]
 
-    # output dir: final_output/<pdb_id>
+    # output dir: test_output/<pdb_id>
     out_dir = os.path.join(out_root, pdb_id)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -155,7 +155,7 @@ def process_one_csv(csv_path: str, out_root: str, top_k: int, refine_mode: str) 
 def main():
     ap = argparse.ArgumentParser(description="Refine lowest-K RMSD conformations into one fitted structure per target.")
     ap.add_argument("--in_dir", type=str, default="prepared_dataset", help="Directory containing *_rmsd.csv files.")
-    ap.add_argument("--out_dir", type=str, default="final_output", help="Directory to write per-target outputs.")
+    ap.add_argument("--out_dir", type=str, default="test_output", help="Directory to write per-target outputs.")
     ap.add_argument("--top_k", type=int, default=10, help="Number of lowest-RMSD rows to use.")
     ap.add_argument("--mode", type=str, default="standard", choices=["fast", "standard", "premium"],
                     help="Refiner mode.")

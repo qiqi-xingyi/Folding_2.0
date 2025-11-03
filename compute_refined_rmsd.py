@@ -4,7 +4,7 @@
 # @Email : yzhan135@kent.edu
 # @File:compute_refined_rmsd.py
 #
-# Compute RMSD for each final_output/<pdb_id>/refined_ca.pdb against reference CA
+# Compute RMSD for each test_output/<pdb_id>/refined_ca.pdb against reference CA
 # defined by dataset/benchmark_info.txt (residue span) and PDBbind pocket/protein.
 # Picks the best-matching reference chain and aligns with Kabsch. Writes a single CSV.
 
@@ -203,7 +203,7 @@ def compute_one(pdb_id: str,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--final_root", type=str, default="final_output", help="Directory with per-PDB refined_ca.pdb")
+    ap.add_argument("--final_root", type=str, default="test_output", help="Directory with per-PDB refined_ca.pdb")
     ap.add_argument("--dataset_root", type=str, default="dataset", help="Dataset root containing Pdbbind/")
     ap.add_argument("--bench_info", type=str, default="dataset/benchmark_info.txt", help="Benchmark index with residue spans")
     ap.add_argument("--only", type=str, default="", help="Comma-separated pdb_ids to restrict processing, e.g. '1e2k,4f5y'")
