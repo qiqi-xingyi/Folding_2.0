@@ -158,7 +158,7 @@ def main():
     ap.add_argument("--mode",default="premium",choices=["fast","standard","premium"])
     ap.add_argument("--polish",action="store_true")
     ap.add_argument("--stop",type=float,default=2.5)
-    ap.add_argument("--nudging_eta",type=float,default=0.3)
+    ap.add_argument("--nudging_eta",type=float,default=0.4)
     a=ap.parse_args()
     os.makedirs(a.out_dir,exist_ok=True)
     bench=read_benchmark_ranges(os.path.join(a.dataset_dir,"benchmark_info.txt"))
