@@ -290,7 +290,7 @@ def group_fallback_refine(decoded_sorted: pd.DataFrame, native_ca: np.ndarray,
     pool = decoded_sorted.iloc[:M].copy()
     index_list = list(pool.index)
 
-    max_s = min(10, M)
+    max_s = min(5, M)
     for s in range(max_s, 1, -1):
         for combo in itertools.combinations(index_list, s):
             subset = pool.loc[list(combo)].copy()
