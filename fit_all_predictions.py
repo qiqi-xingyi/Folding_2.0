@@ -139,9 +139,9 @@ def try_refine(cluster_df: pd.DataFrame, out_dir: str, mode: str,
         refine_mode=mode,
         positions_col="main_positions",
         vectors_col="main_vectors",
-        energy_key="score",                 # score作为能量
+        energy_key="score",
         sequence_col="sequence",
-        energy_weights={"score": 2.5},      # 更偏置的样本权重
+        energy_weights={"score": 2.5},
         proj_smooth_strength=sch["proj_smooth_strength"],
         proj_iters=sch["proj_iters"],
         target_ca_distance=sch["target_ca_distance"],
