@@ -53,7 +53,6 @@ def read_benchmark_info(path: Path) -> Dict[str, Dict[str, Any]]:
 
 
 def parse_residue_span(span: str) -> Tuple[int, int]:
-    # e.g., "47-59" -> (47, 59), inclusive
     s = span.strip()
     if "-" not in s:
         raise ValueError(f"Invalid residue span: {s}")
@@ -62,7 +61,6 @@ def parse_residue_span(span: str) -> Tuple[int, int]:
 
 
 def kabsch_align(P: np.ndarray, Q: np.ndarray) -> Tuple[np.ndarray, float]:
-    # P, Q: (N, 3). Align P to Q. Return (P_aligned, rmsd)
     if P.shape != Q.shape or P.shape[1] != 3:
         raise ValueError("Input shapes must be (N,3) and equal.")
     Pc = P.mean(axis=0)
@@ -110,6 +108,35 @@ def load_reference_ca(pdb_path: Path, start_res: int, end_res: int) -> Optional[
     return np.asarray(ca, dtype=np.float64)
 
 
+def load_reference_ca_by_chain(pdb_path: Path, start_res: int, end_res: int) -> Dict[str, np.ndarray]:
+    chains: Dict[str, np.ndarray] = {}
+    if not pdb_path.exists():
+        return chains
+    tmp: Dict[str, List[List[float]]] = {}
+    with pdb_path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if not line.startswith("ATOM"):
+                continue
+            if line[12:16].strip() != "CA":
+                continue
+            chain_id = line[21].strip() or "_"
+            try:
+                resseq = int(line[22:26])
+            except ValueError:
+                continue
+            if resseq < start_res or resseq > end_res:
+                continue
+            try:
+                x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
+            except ValueError:
+                continue
+            tmp.setdefault(chain_id, []).append([x, y, z])
+    for c, arr in tmp.items():
+        if arr:
+            chains[c] = np.asarray(arr, dtype=np.float64)
+    return chains
+
+
 def decode_main_positions(row: Dict[str, Any]) -> Optional[np.ndarray]:
     pos = row.get("main_positions")
     if pos is None:
@@ -141,12 +168,10 @@ def merge_inputs_per_pdb(pdb_id: str, pdb_dir: Path) -> Tuple[List[Dict[str, Any
     if not energies_p.exists() or not features_p.exists():
         raise FileNotFoundError(f"Missing energies/features for {pdb_id}: {pdb_dir}")
 
-    # index by bitstring
     E: Dict[str, Dict[str, Any]] = {}
     for row in read_jsonl(energies_p):
         bs = row.get("bitstring")
         if not bs:
-            # fall back: some energy rows embed bitstring key in a different place
             bs = row.get("id") or row.get("bit_str")
         if not bs:
             continue
@@ -168,10 +193,10 @@ def merge_inputs_per_pdb(pdb_id: str, pdb_dir: Path) -> Tuple[List[Dict[str, Any
             bs = row.get("bitstring")
             if not bs:
                 continue
-            if "sequence" in row and isinstance(row["sequence"], str):
-                seq_by_bs[bs] = row["sequence"]
+            seq = row.get("sequence") if isinstance(row.get("sequence"), str) else ""
             P = decode_main_positions(row)
-            if P is not None:
+            if seq and P is not None:
+                seq_by_bs[bs] = seq
                 pos_by_bs[bs] = P
 
     merged_rows: List[Dict[str, Any]] = []
@@ -185,7 +210,6 @@ def merge_inputs_per_pdb(pdb_id: str, pdb_dir: Path) -> Tuple[List[Dict[str, Any
         seq = E.get(bs, {}).get("sequence") or F.get(bs, {}).get("sequence") or seq_by_bs.get(bs) or ""
         row["sequence"] = seq
 
-        # copy numeric features from energies and features
         for src in (E.get(bs, {}), F.get(bs, {})):
             for k, v in src.items():
                 if k in ("sequence", "bitstring", "main_positions", "side_positions", "fifth_bit"):
@@ -212,27 +236,46 @@ def compute_rmsd_records(
     pocket_p = pdbbind_root / pdb_id / f"{pdb_id}_pocket.pdb"
     protein_p = pdbbind_root / pdb_id / f"{pdb_id}_protein.pdb"
 
-    ref = load_reference_ca(pocket_p, start_res, end_res)
-    if ref is None:
-        ref = load_reference_ca(protein_p, start_res, end_res)
-    if ref is None:
+    ref_chains = load_reference_ca_by_chain(pocket_p, start_res, end_res)
+    if not ref_chains:
+        ref_chains = load_reference_ca_by_chain(protein_p, start_res, end_res)
+    if not ref_chains:
         raise FileNotFoundError(f"Cannot load reference CA for {pdb_id}")
 
-    L = ref.shape[0]
+    lengths = [rec["positions"].shape[0]
+               for rec in pos_cache.values()
+               if isinstance(rec.get("positions"), np.ndarray)
+               and rec["positions"].ndim == 2 and rec["positions"].shape[1] == 3]
+    if not lengths:
+        return []
+
+    from collections import Counter
+    L_mode = Counter(lengths).most_common(1)[0][0]
+
+    chain_choices = [(cid, arr.shape[0], arr) for cid, arr in ref_chains.items()]
+    chain_choices.sort(key=lambda x: (abs(x[1] - L_mode), -x[1]))
+    ref_chain_id, L_ref, ref_full = chain_choices[0]
+
     out: List[Dict[str, Any]] = []
     for bs, rec in pos_cache.items():
-        P = rec["positions"]
-        if P.shape[0] != L:
-            # length mismatch; skip
+        P = rec.get("positions")
+        if not isinstance(P, np.ndarray) or P.ndim != 2 or P.shape[1] != 3:
             continue
-        _, rmsd = kabsch_align(P, ref)
-        rel = graded_label_from_rmsd(rmsd)
+
+        L_common = min(P.shape[0], L_ref)
+        if L_common < 3:
+            continue
+        P_use = P[:L_common]
+        Q_use = ref_full[:L_common]
+
+        _, rmsd_val = kabsch_align(P_use, Q_use)
+        rel = graded_label_from_rmsd(rmsd_val)
         out.append({
             "pdb_id": pdb_id,
             "group_id": 0,
             "bitstring": bs,
             "sequence": rec.get("sequence", ""),
-            "rmsd": float(rmsd),
+            "rmsd": float(rmsd_val),
             "rel": int(rel),
         })
     return out
@@ -285,6 +328,7 @@ def main():
     ap.add_argument("--dataset_root", type=str, default="dataset")
     ap.add_argument("--bench_info", type=str, default="dataset/benchmark_info.txt")
     ap.add_argument("--out_root", type=str, default="prepared_dataset")
+    ap.add_argument("--only", type=str, default="", help="Comma-separated pdb_ids to process, e.g. '4f5y,6czf'.")
     args = ap.parse_args()
 
     pp_root = Path(args.pp_root)
@@ -298,6 +342,13 @@ def main():
     if not pdb_ids:
         print("[WARN] No pdb directories discovered under:", pp_root.resolve())
         return
+
+    if args.only.strip():
+        allow = {p.strip().lower() for p in args.only.split(",") if p.strip()}
+        pdb_ids = [p for p in pdb_ids if p.lower() in allow]
+        if not pdb_ids:
+            print(f"[WARN] No pdb_ids matched --only={args.only}")
+            return
 
     print(f"[INFO] Found {len(pdb_ids)} pdbs: {', '.join(pdb_ids[:8])}{' ...' if len(pdb_ids)>8 else ''}")
 
