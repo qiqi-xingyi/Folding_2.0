@@ -8,8 +8,8 @@
 # - Robust checkpoint path resolution (script-dir fallback).
 # - Rebuild sklearn StandardScaler from dict (mean_/scale_) if needed.
 # - Device auto-pick (cuda/mps/cpu).
-# - Per-group ranking (group_id).
-# - Optional top-k export.
+# - Per-(pdb_id, group_id) ranking.
+# - Optional top-k export; zero-fill missing base features.
 
 import argparse
 import json
@@ -32,14 +32,12 @@ def pick_device(arg_device: Optional[str]) -> torch.device:
         return torch.device(arg_device)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    # Apple Silicon / Metal
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
 
 def resolve_checkpoint_path(arg_path: str) -> Path:
-    """Try user path first; if missing, try relative to this script's directory."""
     p = Path(arg_path)
     if p.exists():
         return p
@@ -57,9 +55,7 @@ def load_jsonl(path: Path) -> pd.DataFrame:
             if not line:
                 continue
             rows.append(json.loads(line))
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 def seq_features_from_sequence(seq: str, feature_names: List[str]) -> Dict[str, float]:
@@ -85,10 +81,6 @@ def seq_features_from_sequence(seq: str, feature_names: List[str]) -> Dict[str, 
 
 
 def rebuild_scaler_if_needed(scaler_obj: Any) -> Any:
-    """
-    Accept either an sklearn-like object with .transform or a dict with mean_/scale_.
-    Rebuild a StandardScaler when a dict is provided.
-    """
     if hasattr(scaler_obj, "transform"):
         return scaler_obj
     if isinstance(scaler_obj, dict) and "mean_" in scaler_obj and "scale_" in scaler_obj:
@@ -100,9 +92,18 @@ def rebuild_scaler_if_needed(scaler_obj: Any) -> Any:
         s.n_features_in_ = int(s.mean_.shape[0])
         return s
     raise ValueError(
-        "Invalid 'scaler' in checkpoint: expected an sklearn-like object with .transform "
+        "Invalid 'scaler' in checkpoint: expected sklearn-like object with .transform "
         "or a dict containing mean_ and scale_."
     )
+
+
+def ensure_base_features(df: pd.DataFrame, base_feature_names: List[str]) -> pd.DataFrame:
+    """Ensure all base features exist; create missing columns filled with 0.0."""
+    out = df.copy()
+    for col in base_feature_names:
+        if col not in out.columns:
+            out[col] = 0.0
+    return out
 
 
 def build_design_matrix(
@@ -113,18 +114,16 @@ def build_design_matrix(
 ) -> np.ndarray:
     if df.empty:
         raise ValueError("Input dataframe is empty.")
-    missing = [c for c in base_feature_names if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required base feature columns: {missing}")
-
-    X_base = df[base_feature_names].astype(float).to_numpy(copy=True)
-    X_base = scaler.transform(X_base)
-
-    seq_rows: List[Dict[str, float]] = []
     if "sequence" not in df.columns:
         raise ValueError("Missing required column: sequence")
-    for seq in df["sequence"].astype(str).tolist():
-        seq_rows.append(seq_features_from_sequence(seq, seq_feature_names))
+
+    df2 = ensure_base_features(df, base_feature_names)
+    X_base = df2[base_feature_names].astype(float).to_numpy(copy=True)
+    X_base = scaler.transform(X_base)
+
+    seq_rows: List[Dict[str, float]] = [
+        seq_features_from_sequence(seq, seq_feature_names) for seq in df["sequence"].astype(str).tolist()
+    ]
     X_seq = pd.DataFrame(seq_rows, columns=seq_feature_names).fillna(0.0).to_numpy(copy=True)
 
     X = np.concatenate([X_base, X_seq], axis=1)
@@ -162,7 +161,7 @@ def infer_batches(
     for i in range(0, N, batch_size):
         xb = torch.from_numpy(X[i:i+batch_size]).float().to(device, non_blocking=True)
         out = model(xb)
-        logits = out["logits"]  # (B, C)
+        logits = out["logits"]
         prob = torch.softmax(logits, dim=-1)
 
         if score_mode == "prob_rel3":
@@ -181,16 +180,20 @@ def infer_batches(
 
 
 def rank_within_groups(df: pd.DataFrame, scores: np.ndarray) -> pd.DataFrame:
-    df_out = df.copy()
-    df_out["score"] = scores
-    if "group_id" not in df_out.columns:
-        df_out["group_id"] = 0
-    df_out["rank_in_group"] = (
-        df_out.groupby("group_id")["score"]
-             .rank(method="first", ascending=False)
-             .astype(int)
+    out = df.copy()
+    out["score"] = scores
+    if "group_id" not in out.columns:
+        out["group_id"] = 0
+    # rank within (pdb_id, group_id)
+    out["rank_in_group"] = (
+        out.groupby(["pdb_id", "group_id"])["score"]
+           .rank(method="first", ascending=False)
+           .astype(int)
     )
-    return df_out.sort_values(["group_id", "rank_in_group", "score"], ascending=[True, True, False])
+    return out.sort_values(
+        ["pdb_id", "group_id", "rank_in_group", "score"],
+        ascending=[True, True, True, False]
+    )
 
 
 def main():
@@ -230,16 +233,18 @@ def main():
     scaler = rebuild_scaler_if_needed(ckpt["scaler"])
 
     df = load_jsonl(Path(args.input_jsonl))
-    for c in ["group_id", "pdb_id", "sequence", "bitstring"]:
+    for c in ["pdb_id", "sequence", "bitstring"]:
         if c not in df.columns:
             raise ValueError(f"Missing required column: {c}")
+    if "group_id" not in df.columns:
+        df["group_id"] = 0
 
     X = build_design_matrix(df, base_feature_names, seq_feature_names, scaler)
     model = build_model_from_ckpt(
         ckpt, input_dim=X.shape[1], num_classes=4, dropout=ckpt.get("args", {}).get("dropout", 0.3)
     ).to(device)
 
-    logits, scores = infer_batches(model, X, device, batch_size=args.batch_size, score_mode=args.score_mode)
+    _, scores = infer_batches(model, X, device, batch_size=args.batch_size, score_mode=args.score_mode)
     df_ranked = rank_within_groups(df, scores)
 
     out_csv = Path(args.out_csv)
@@ -249,8 +254,8 @@ def main():
 
     if args.topk and args.topk > 0:
         tops = (
-            df_ranked.sort_values(["group_id", "score"], ascending=[True, False])
-                    .groupby("group_id")
+            df_ranked.sort_values(["pdb_id", "group_id", "score"], ascending=[True, True, False])
+                    .groupby(["pdb_id", "group_id"])
                     .head(args.topk)
         )
         out_top = out_csv.with_name(out_csv.stem + f"_top{args.topk}.csv")
