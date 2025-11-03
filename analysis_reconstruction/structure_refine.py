@@ -445,6 +445,12 @@ class StructureRefiner:
             else:
                 aligned_X = align_to_reference(anchor, X)
             aligned.append(aligned_X)
+
+        # >>> add this block: unify length before stacking <<<
+        L_common = min(A.shape[0] for A in aligned)
+        aligned = [A[:L_common] for A in aligned]
+        # <<< end added block >>>
+
         self.aligned_list = aligned
 
         # true GPA iterations (unweighted mean orientation stabilization)
