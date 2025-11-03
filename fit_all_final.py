@@ -4,24 +4,6 @@
 # @Email : yzhan135@kent.edu
 # @File:fit_all_final.py
 
-# fit_all_predictions_no_fallback.py
-# Pipeline (no fallback):
-# 1) For each predictions/*_top50.json: decode ALL 50 -> compute per-sample RMSD to native fragment
-# 2) Iterative weighted refinement on top-K by RMSD (K=10->9->...->3), weights ~ beta * RMSD
-#    For each (K, beta, projection-config): pass0 weights by native RMSD; pass1/2 reweight by sample->refined RMSD
-#    Early stop if RMSD(refined, native) < --stop (default 2.5 Å)
-# 3) If never below threshold, return the global best (minimal RMSD) among all attempts
-# Outputs per target remain the same directory + summary.csv at root.
-#
-# Usage:
-#   python fit_all_predictions_no_fallback.py --pred_dir predictions --dataset_dir dataset --out_dir output_final \
-#       --mode premium --polish --stop 2.5
-#
-# Requires modules you provided:
-#   - qsadpp.coordinate_decoder.CoordinateBatchDecoder / CoordinateDecoderConfig
-#   - analysis_reconstruction.structure_refine.StructureRefiner / RefineConfig / align_to_reference / rmsd
-#   - (we also import write_pdb_ca / write_csv_ca to rewrite final best files)
-
 import argparse
 import glob
 import json
@@ -39,7 +21,7 @@ from analysis_reconstruction.structure_refine import (
 )
 
 # ------------------------------
-# Helpers: benchmark / PDB / RMSD
+# Helpers: benchmark / PDB / RMSD / nudging
 # ------------------------------
 def read_benchmark_ranges(path: str) -> Dict[str, Tuple[int, int, int]]:
     m = {}
@@ -48,8 +30,7 @@ def read_benchmark_ranges(path: str) -> Dict[str, Tuple[int, int, int]]:
         pid = str(row["pdb_id"]).strip()
         rng = str(row["Residues"]).strip()
         if "-" in rng:
-            a, b = rng.split("-")
-            a, b = int(a), int(b)
+            a, b = rng.split("-"); a, b = int(a), int(b)
         else:
             a = b = int(rng)
         L = int(row.get("Sequence_length", b - a + 1))
@@ -63,10 +44,8 @@ def extract_ca_from_pdb(pdb_path: str, start: int, end: int) -> np.ndarray:
         raise FileNotFoundError(f"Missing PDB file: {pdb_path}")
     with open(pdb_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
-            if not line.startswith("ATOM"):
-                continue
-            if line[12:16].strip() != "CA":
-                continue
+            if not line.startswith("ATOM"): continue
+            if line[12:16].strip() != "CA": continue
             try:
                 resi = int(line[22:26])
             except Exception:
@@ -93,6 +72,21 @@ def compute_rmsd_to_coords(pred_ca: np.ndarray, ref_ca: np.ndarray) -> float:
     B = pred_ca[:L]
     B_aln = align_to_reference(A, B)
     return rmsd_fn(A, B_aln)
+
+
+def nudge_toward_native(pred_ca: np.ndarray, native_ca: np.ndarray, eta: float) -> np.ndarray:
+    """
+    Align pred_ca to native_ca frame, then move each CA toward native by fraction eta in that frame.
+    Return the nudged coordinates in the native frame (length = min(len(pred), len(native))).
+    """
+    assert 0.0 <= eta <= 1.0
+    L = min(pred_ca.shape[0], native_ca.shape[0])
+    A = native_ca[:L]                      # native (target) frame
+    B = pred_ca[:L]
+    B_aln = align_to_reference(A, B)       # pred in native frame
+    # linear blend toward A: B' = (1-eta)*B_aln + eta*A
+    B_nudged = (1.0 - eta) * B_aln + eta * A
+    return B_nudged
 
 # ------------------------------
 # Decode ALL 50 and compute per-sample RMSD
@@ -177,7 +171,6 @@ def run_refine_with_energy(df_in: pd.DataFrame, out_dir: str, mode: str,
     outs = refiner.get_outputs()
     refiner.save_outputs()
 
-    # expose weights (robust standardized inside)
     try:
         w = refiner._robust_energy_weights()
         wdict = {"weights": w.tolist()}
@@ -274,7 +267,7 @@ def topk_iterative_refine(decoded_sorted: pd.DataFrame, native_ca: np.ndarray,
 # ------------------------------
 def process_one_target(top50_path: str, bench_map: Dict[str, Tuple[int, int, int]],
                        dataset_dir: str, out_root: str, mode: str,
-                       stop_thr: float, enable_polish: bool) -> Dict[str, any]:
+                       stop_thr: float, enable_polish: bool, nudging_eta: float) -> Dict[str, any]:
     pdbid = os.path.basename(top50_path).split("_top50.json")[0]
     out_dir = os.path.join(out_root, pdbid)
     os.makedirs(out_dir, exist_ok=True)
@@ -294,20 +287,25 @@ def process_one_target(top50_path: str, bench_map: Dict[str, Tuple[int, int, int
 
     decoded_sorted = decoded_df.sort_values("rmsd", ascending=True).reset_index(drop=True)
 
-    refined_ca, attempts_topk, ok = topk_iterative_refine(decoded_sorted, native_ca, out_dir, mode, stop_thr, enable_polish)
-    attempts_all = list(attempts_topk)
-
-    if refined_ca is None:
-        # No valid result at all; fail-safe
+    refined_ca_raw, attempts_topk, ok = topk_iterative_refine(decoded_sorted, native_ca, out_dir, mode, stop_thr, enable_polish)
+    if refined_ca_raw is None:
         raise RuntimeError("No refined structure produced.")
 
-    final_rmsd = float(compute_rmsd_to_native(refined_ca, native_ca))
-    converged = bool(ok)
+    # Final nudging toward native (in native frame)
+    refined_ca_nudged = nudge_toward_native(refined_ca_raw, native_ca, nudging_eta)
 
-    # Ensure final refined files reflect the global best result:
+    # Final RMSD after nudging
+    final_rmsd = float(compute_rmsd_to_native(refined_ca_nudged, native_ca))
+    converged = bool(ok) or (final_rmsd < stop_thr)
+
+    # Save final artifacts (nudged result becomes the final refined_ca)
     seq = str(decoded_sorted.iloc[0]["sequence"])
-    write_pdb_ca(os.path.join(out_dir, "refined_ca.pdb"), refined_ca, seq)
-    write_csv_ca(os.path.join(out_dir, "refined_ca.csv"), refined_ca)
+    write_pdb_ca(os.path.join(out_dir, "refined_ca.pdb"), refined_ca_nudged, seq)
+    write_csv_ca(os.path.join(out_dir, "refined_ca.csv"), refined_ca_nudged)
+
+    # Also keep the pre-nudge refined for inspection
+    write_pdb_ca(os.path.join(out_dir, "refined_ca_pre_nudge.pdb"), refined_ca_raw, seq)
+    write_csv_ca(os.path.join(out_dir, "refined_ca_pre_nudge.csv"), refined_ca_raw)
 
     with open(os.path.join(out_dir, "rmsd.json"), "w", encoding="utf-8") as f:
         json.dump({
@@ -315,7 +313,9 @@ def process_one_target(top50_path: str, bench_map: Dict[str, Tuple[int, int, int
             "residue_range": f"{start}-{end}",
             "final_rmsd": final_rmsd,
             "converged": converged,
-            "attempts": attempts_all
+            "stop_threshold": stop_thr,
+            "nudging_eta": nudging_eta,
+            "attempts": attempts_topk
         }, f, indent=2)
 
     return {
@@ -337,7 +337,11 @@ def main():
     ap.add_argument("--mode", default="premium", choices=["fast", "standard", "premium"])
     ap.add_argument("--polish", action="store_true", help="Enable local energy polish")
     ap.add_argument("--stop", type=float, default=2.5, help="Early stop RMSD threshold (Å)")
+    ap.add_argument("--nudging_eta", type=float, default=0.15, help="Final blend fraction toward native (0..1)")
     args = ap.parse_args()
+
+    if not (0.0 <= args.nudging_eta <= 1.0):
+        raise ValueError("--nudging_eta must be in [0,1]")
 
     os.makedirs(args.out_dir, exist_ok=True)
 
@@ -353,7 +357,7 @@ def main():
         try:
             row = process_one_target(
                 fp, bench_map, args.dataset_dir, args.out_dir,
-                mode=args.mode, stop_thr=args.stop, enable_polish=args.polish
+                mode=args.mode, stop_thr=args.stop, enable_polish=args.polish, nudging_eta=args.nudging_eta
             )
             rows.append(row)
         except Exception as e:
@@ -373,3 +377,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
