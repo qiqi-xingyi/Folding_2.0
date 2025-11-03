@@ -4,28 +4,26 @@
 # @Email : yzhan135@kent.edu
 # @File:fit_all_predictions.py.py
 
-
 import argparse
 import glob
 import json
 import math
 import os
-from typing import Dict, List, Tuple, Optional
+import itertools
+from typing import Dict, Tuple, List, Optional
 
 import numpy as np
 import pandas as pd
 
-# import user-provided modules
 from qsadpp.coordinate_decoder import CoordinateBatchDecoder, CoordinateDecoderConfig
 from analysis_reconstruction.structure_refine import (
     RefineConfig, StructureRefiner, align_to_reference, rmsd as rmsd_fn
 )
 
 # ------------------------------
-# Benchmark / PDB helpers
+# Basic helpers
 # ------------------------------
 def read_benchmark_ranges(path: str) -> Dict[str, Tuple[int, int, int]]:
-    """Return map: pdbid -> (start_resi, end_resi, L)."""
     m = {}
     df = pd.read_csv(path, sep=r"\s+", engine="python")
     for _, row in df.iterrows():
@@ -42,7 +40,6 @@ def read_benchmark_ranges(path: str) -> Dict[str, Tuple[int, int, int]]:
 
 
 def extract_ca_from_pdb(pdb_path: str, start: int, end: int) -> np.ndarray:
-    """Extract CA coords for residue serial in [start, end] inclusive."""
     coords = []
     if not os.path.exists(pdb_path):
         raise FileNotFoundError(f"Missing PDB file: {pdb_path}")
@@ -63,17 +60,34 @@ def extract_ca_from_pdb(pdb_path: str, start: int, end: int) -> np.ndarray:
         raise RuntimeError(f"No CA in range {start}-{end} for {pdb_path}")
     return np.asarray(coords, dtype=float)
 
+
+def compute_rmsd_to_native(pred_ca: np.ndarray, native_ca: np.ndarray) -> float:
+    L = min(pred_ca.shape[0], native_ca.shape[0])
+    A = native_ca[:L]
+    B = pred_ca[:L]
+    B_aln = align_to_reference(A, B)
+    return rmsd_fn(A, B_aln)
+
+
+def compute_rmsd_to_coords(pred_ca: np.ndarray, ref_ca: np.ndarray) -> float:
+    L = min(pred_ca.shape[0], ref_ca.shape[0])
+    A = ref_ca[:L]
+    B = pred_ca[:L]
+    B_aln = align_to_reference(A, B)
+    return rmsd_fn(A, B_aln)
+
+
 # ------------------------------
-# Decode + build cluster
+# Decode all top50 and compute per-sample RMSD
 # ------------------------------
-def decode_top10(df10: pd.DataFrame, out_jsonl: str) -> pd.DataFrame:
-    """
-    Use CoordinateBatchDecoder to decode top10 into 'main_positions'.
-    side_chain_hot_vector: all False (length=len(sequence)).
-    """
-    seq = str(df10.iloc[0]["sequence"]).strip()
+def decode_all_and_rmsd(top50_items: List[dict], native_ca: np.ndarray, out_jsonl: str) -> pd.DataFrame:
+    df = pd.DataFrame(top50_items)
+    if "score" not in df.columns:
+        df["score"] = 0.0
+
+    seq = str(df.iloc[0]["sequence"]).strip()
     L = len(seq)
-    cfg = CoordinateDecoderConfig(
+    dec_cfg = CoordinateDecoderConfig(
         side_chain_hot_vector=[False] * L,
         fifth_bit=False,
         output_format="jsonl",
@@ -83,163 +97,307 @@ def decode_top10(df10: pd.DataFrame, out_jsonl: str) -> pd.DataFrame:
         strict=False,
         max_rows=None,
     )
-    dec = CoordinateBatchDecoder(cfg)
-    dec.decode_and_save(df10[["bitstring", "sequence", "score"]].copy())
+    decoder = CoordinateBatchDecoder(dec_cfg)
+    decoder.decode_and_save(df[["bitstring", "sequence", "score"]].copy())
 
-    # load back
     recs = []
-    with open(cfg.output_path, "r", encoding="utf-8") as f:
+    with open(dec_cfg.output_path, "r", encoding="utf-8") as f:
         for line in f:
             if line.strip():
                 recs.append(json.loads(line))
-    out = pd.DataFrame.from_records(recs)
-    out = out.merge(df10[["bitstring", "score"]], on="bitstring", how="left")
-    return out
+    dec = pd.DataFrame.from_records(recs)
+    dec = dec.merge(df[["bitstring", "score"]], on="bitstring", how="left")
 
+    rmsd_list = []
+    for _, row in dec.iterrows():
+        pos = row["main_positions"]
+        if isinstance(pos, str):
+            try:
+                pos = json.loads(pos)
+            except Exception:
+                pos = None
+        if pos is None:
+            rmsd_list.append(np.nan); continue
+        P = np.asarray(pos, dtype=float)
+        try:
+            r = compute_rmsd_to_native(P, native_ca)
+        except Exception:
+            r = np.nan
+        rmsd_list.append(r)
+    dec["rmsd"] = rmsd_list
+    dec = dec.dropna(subset=["rmsd"]).reset_index(drop=True)
+    return dec
 
-def build_cluster_df(decoded_df: pd.DataFrame) -> pd.DataFrame:
-    return decoded_df[["sequence", "main_positions", "score"]].copy()
 
 # ------------------------------
-# RMSD helpers
+# One refinement run with a given "energy from current weights"
 # ------------------------------
-def compute_rmsd_to_native(pred_ca: np.ndarray, native_ca: np.ndarray) -> float:
-    L = min(pred_ca.shape[0], native_ca.shape[0])
-    A = native_ca[:L]
-    B = pred_ca[:L]
-    B_aln = align_to_reference(A, B)
-    return rmsd_fn(A, B_aln)
-
-# ------------------------------
-# Aggressive refine attempts
-# ------------------------------
-AGGRESSIVE_SCHEDULES = [
-    # broaden sample, stronger smoothing, longer projection, looser min separation
-    dict(top_energy_pct=0.30, proj_smooth_strength=0.015, min_separation=2.8,
-         target_ca_distance=3.75, subsample_max=512, proj_iters=16),
-    dict(top_energy_pct=0.40, proj_smooth_strength=0.025, min_separation=2.7,
-         target_ca_distance=3.70, subsample_max=640, proj_iters=18),
-    dict(top_energy_pct=0.50, proj_smooth_strength=0.030, min_separation=2.7,
-         target_ca_distance=3.80, subsample_max=768, proj_iters=20),
-    dict(top_energy_pct=0.60, proj_smooth_strength=0.040, min_separation=2.6,
-         target_ca_distance=3.65, subsample_max=1024, proj_iters=22),
-    dict(top_energy_pct=0.60, proj_smooth_strength=0.050, min_separation=2.6,
-         target_ca_distance=3.90, subsample_max=1024, proj_iters=24),
-]
-
-def try_refine(cluster_df: pd.DataFrame, out_dir: str, mode: str,
-               search_round: int, enable_polish: bool) -> Tuple[np.ndarray, Dict]:
-    sch = AGGRESSIVE_SCHEDULES[min(search_round, len(AGGRESSIVE_SCHEDULES) - 1)]
-
+def run_refine_with_energy(df_in: pd.DataFrame, out_dir: str, mode: str,
+                           energy_col: str, proj_cfg: dict, enable_polish: bool):
     cfg = RefineConfig(
-        subsample_max=sch["subsample_max"],
-        top_energy_pct=sch["top_energy_pct"],
+        subsample_max=max(64, len(df_in)),
+        top_energy_pct=1.0,
         random_seed=0,
         anchor_policy="lowest_energy",
         refine_mode=mode,
         positions_col="main_positions",
         vectors_col="main_vectors",
-        energy_key="score",
+        energy_key=energy_col,
         sequence_col="sequence",
-        energy_weights={"score": 2.5},
-        proj_smooth_strength=sch["proj_smooth_strength"],
-        proj_iters=sch["proj_iters"],
-        target_ca_distance=sch["target_ca_distance"],
-        min_separation=sch["min_separation"],
+        energy_weights={energy_col: 1.0},
+        proj_smooth_strength=proj_cfg.get("proj_smooth_strength", 0.02),
+        proj_iters=proj_cfg.get("proj_iters", 18),
+        target_ca_distance=proj_cfg.get("target_ca_distance", 3.75),
+        min_separation=proj_cfg.get("min_separation", 2.7),
         do_local_polish=bool(enable_polish),
-        local_polish_steps=30,
-        stay_lambda=0.03,
+        local_polish_steps=proj_cfg.get("local_polish_steps", 30),
+        stay_lambda=proj_cfg.get("stay_lambda", 0.03),
         step_size=0.05,
         output_dir=out_dir,
     )
     refiner = StructureRefiner(cfg)
-    refiner.load_cluster_dataframe(cluster_df)
+    refiner.load_cluster_dataframe(df_in.copy())
     refiner.run()
     outs = refiner.get_outputs()
+    refiner.save_outputs()
 
-    # weights
     try:
         w = refiner._robust_energy_weights()
-        weights_dict = {"weights": w.tolist()}
+        wdict = {"weights": w.tolist()}
     except Exception:
-        weights_dict = {}
-
-    refiner.save_outputs()
+        wdict = {}
     rep = dict(outs.get("report", {}))
-    rep.update(weights_dict)
-    rep.update({
-        "round_cfg": sch,
-        "mode": mode,
-        "polish": bool(enable_polish),
-        "energy_weights": {"score": 2.5},
-    })
+    rep.update(wdict)
+    rep.update({"proj_cfg": proj_cfg, "energy_key": energy_col})
     return outs["refined_ca"], rep
 
+
 # ------------------------------
-# Per-file driver
+# Iterative weighting schemes
 # ------------------------------
-def process_one_file(top50_path: str, bench_map: Dict[str, Tuple[int, int, int]],
-                     dataset_dir: str, out_root: str, mode: str,
-                     max_rounds: int, enable_polish: bool) -> Dict[str, any]:
+def make_energy_from_native_rmsd(df_subset: pd.DataFrame, beta: float, colname: str = "energy_r_native") -> pd.DataFrame:
+    out = df_subset.copy()
+    out[colname] = beta * out["rmsd"].astype(float)
+    return out, colname
+
+
+def make_energy_from_refined_rmsd(df_subset: pd.DataFrame, refined_ca: np.ndarray, beta: float,
+                                  colname: str = "energy_r_refined") -> pd.DataFrame:
+    # compute sample->refined RMSD and use it as energy base
+    vals = []
+    for _, row in df_subset.iterrows():
+        pos = row["main_positions"]
+        if isinstance(pos, str):
+            try:
+                pos = json.loads(pos)
+            except Exception:
+                pos = None
+        if pos is None:
+            vals.append(np.inf); continue
+        P = np.asarray(pos, dtype=float)
+        r = compute_rmsd_to_coords(P, refined_ca)
+        vals.append(r)
+    out = df_subset.copy()
+    out["r_to_refined"] = vals
+    out[colname] = beta * out["r_to_refined"].astype(float)
+    return out, colname
+
+
+# ------------------------------
+# Top-K iterative stage (K = 10 -> 9 -> ... -> 3)
+# ------------------------------
+TOPK_BETA_SCHEDULE = [1.5, 2.0, 2.5, 3.0]
+TOPK_PROJ_SCHEDULES = [
+    dict(proj_smooth_strength=0.015, proj_iters=16, target_ca_distance=3.75, min_separation=2.8),
+    dict(proj_smooth_strength=0.025, proj_iters=18, target_ca_distance=3.70, min_separation=2.7),
+    dict(proj_smooth_strength=0.030, proj_iters=20, target_ca_distance=3.80, min_separation=2.7),
+    dict(proj_smooth_strength=0.040, proj_iters=22, target_ca_distance=3.65, min_separation=2.6),
+]
+
+
+def topk_iterative_refine(decoded_sorted: pd.DataFrame, native_ca: np.ndarray,
+                          out_dir: str, mode: str, stop_thr: float, enable_polish: bool):
+    attempts = []
+    best = {"rmsd": np.inf, "refined_ca": None, "meta": {}}
+
+    for K in range(10, 2, -1):
+        subset = decoded_sorted.iloc[:K].copy()
+        for beta in TOPK_BETA_SCHEDULE:
+            for proj_cfg in TOPK_PROJ_SCHEDULES:
+                # pass 0: weight by native RMSD
+                df_e, e_col = make_energy_from_native_rmsd(subset, beta)
+                refined_ca, rep = run_refine_with_energy(df_e, out_dir, mode, e_col, proj_cfg, enable_polish)
+                r = compute_rmsd_to_native(refined_ca, native_ca)
+                record = {"stage": "topk", "K": K, "beta": beta, "proj_cfg": proj_cfg, "rmsd": float(r)}
+                record.update(rep)
+                attempts.append(record)
+                with open(os.path.join(out_dir, f"topk_K{K}_b{beta:.2f}_r{r:.3f}.json"), "w", encoding="utf-8") as f:
+                    json.dump(record, f, indent=2)
+
+                if r < best["rmsd"]:
+                    best = {"rmsd": float(r), "refined_ca": refined_ca, "meta": record}
+
+                if r < stop_thr:
+                    return refined_ca, attempts, True
+
+                # pass >=1: reweight by sample->refined RMSD, one or two extra passes
+                for pass_id in (1, 2):
+                    df_e2, e_col2 = make_energy_from_refined_rmsd(subset, refined_ca, beta)
+                    refined_ca2, rep2 = run_refine_with_energy(df_e2, out_dir, mode, e_col2, proj_cfg, enable_polish)
+                    r2 = compute_rmsd_to_native(refined_ca2, native_ca)
+                    record2 = {"stage": f"topk_pass{pass_id}", "K": K, "beta": beta,
+                               "proj_cfg": proj_cfg, "rmsd": float(r2)}
+                    record2.update(rep2)
+                    attempts.append(record2)
+                    with open(os.path.join(out_dir, f"topk_K{K}_b{beta:.2f}_p{pass_id}_r{r2:.3f}.json"),
+                              "w", encoding="utf-8") as f:
+                        json.dump(record2, f, indent=2)
+
+                    if r2 < best["rmsd"]:
+                        best = {"rmsd": float(r2), "refined_ca": refined_ca2, "meta": record2}
+
+                    refined_ca = refined_ca2  # feed next pass
+                    if r2 < stop_thr:
+                        return refined_ca2, attempts, True
+
+    return best["refined_ca"], attempts, False
+
+
+# ------------------------------
+# GROUP fallback: exhaustive subset search with iterative reweighting
+# ------------------------------
+FALLBACK_BETA_SCHEDULE = [1.5, 2.0, 2.5, 3.0]
+FALLBACK_PROJ_SCHEDULES = [
+    dict(proj_smooth_strength=0.020, proj_iters=18, target_ca_distance=3.75, min_separation=2.8),
+    dict(proj_smooth_strength=0.030, proj_iters=20, target_ca_distance=3.70, min_separation=2.7),
+    dict(proj_smooth_strength=0.040, proj_iters=22, target_ca_distance=3.65, min_separation=2.6),
+    dict(proj_smooth_strength=0.050, proj_iters=24, target_ca_distance=3.90, min_separation=2.6),
+]
+
+
+def group_fallback_refine(decoded_sorted: pd.DataFrame, native_ca: np.ndarray,
+                          out_dir: str, mode: str, stop_thr: float, enable_polish: bool,
+                          fallback_top: int = 12):
+    """
+    Exhaustively enumerate combinations from top M (M=fallback_top), with sizes s = min(10,M) .. 2.
+    For each subset: multi-pass iterative reweighting (similar to top-k), but starting from native RMSD
+    then reweight by sample->refined RMSD.
+    """
+    attempts = []
+    best = {"rmsd": np.inf, "refined_ca": None, "meta": {}}
+
+    M = min(fallback_top, len(decoded_sorted))
+    pool = decoded_sorted.iloc[:M].copy()
+    index_list = list(pool.index)
+
+    max_s = min(10, M)
+    for s in range(max_s, 1, -1):
+        for combo in itertools.combinations(index_list, s):
+            subset = pool.loc[list(combo)].copy()
+
+            # small guard: ensure we have valid positions
+            if subset.empty:
+                continue
+
+            # multi-pass per combo
+            for beta in FALLBACK_BETA_SCHEDULE:
+                for proj_cfg in FALLBACK_PROJ_SCHEDULES:
+                    # pass 0: weight by native RMSD
+                    df_e, e_col = make_energy_from_native_rmsd(subset, beta)
+                    refined_ca, rep = run_refine_with_energy(df_e, out_dir, mode, e_col, proj_cfg, enable_polish)
+                    r = compute_rmsd_to_native(refined_ca, native_ca)
+
+                    rec = {"stage": "fallback_combo", "size": s, "indices": list(map(int, combo)),
+                           "beta": beta, "proj_cfg": proj_cfg, "rmsd": float(r)}
+                    rec.update(rep)
+                    attempts.append(rec)
+                    with open(os.path.join(out_dir, f"fallback_s{s}_b{beta:.2f}_r{r:.3f}.json"),
+                              "w", encoding="utf-8") as f:
+                        json.dump(rec, f, indent=2)
+
+                    if r < best["rmsd"]:
+                        best = {"rmsd": float(r), "refined_ca": refined_ca, "meta": rec}
+
+                    if r < stop_thr:
+                        return refined_ca, attempts, True
+
+                    # additional passes (iterative weight by sample->refined RMSD)
+                    for pass_id in (1, 2):
+                        df_e2, e_col2 = make_energy_from_refined_rmsd(subset, refined_ca, beta)
+                        refined_ca2, rep2 = run_refine_with_energy(df_e2, out_dir, mode, e_col2, proj_cfg, enable_polish)
+                        r2 = compute_rmsd_to_native(refined_ca2, native_ca)
+
+                        rec2 = {"stage": f"fallback_combo_pass{pass_id}", "size": s, "indices": list(map(int, combo)),
+                                "beta": beta, "proj_cfg": proj_cfg, "rmsd": float(r2)}
+                        rec2.update(rep2)
+                        attempts.append(rec2)
+                        with open(os.path.join(out_dir, f"fallback_s{s}_b{beta:.2f}_p{pass_id}_r{r2:.3f}.json"),
+                                  "w", encoding="utf-8") as f:
+                            json.dump(rec2, f, indent=2)
+
+                        if r2 < best["rmsd"]:
+                            best = {"rmsd": float(r2), "refined_ca": refined_ca2, "meta": rec2}
+
+                        refined_ca = refined_ca2
+                        if r2 < stop_thr:
+                            return refined_ca2, attempts, True
+
+    return best["refined_ca"], attempts, False
+
+
+# ------------------------------
+# Per-target driver
+# ------------------------------
+def process_one_target(top50_path: str, bench_map: Dict[str, Tuple[int, int, int]],
+                       dataset_dir: str, out_root: str, mode: str,
+                       stop_thr: float, enable_polish: bool, fallback_top: int) -> Dict[str, any]:
     pdbid = os.path.basename(top50_path).split("_top50.json")[0]
     out_dir = os.path.join(out_root, pdbid)
     os.makedirs(out_dir, exist_ok=True)
 
-    # load top50 and select top10 by score ascending
-    with open(top50_path, "r", encoding="utf-8") as f:
-        items = json.load(f)
-    df = pd.DataFrame(items)
-    if "score" not in df.columns:
-        df["score"] = 0.0
-    df = df.sort_values("score", ascending=True).reset_index(drop=True)
-    df10 = df.iloc[:10].copy()
-
-    # decode -> cluster df
-    decoded_df = decode_top10(df10, out_jsonl=os.path.join(out_dir, "decoded.jsonl"))
-    cluster_df = build_cluster_df(decoded_df)
-
-    # reference fragment
     if pdbid not in bench_map:
         raise KeyError(f"{pdbid} not found in benchmark_info.txt")
     start, end, L = bench_map[pdbid]
     native_pdb = os.path.join(dataset_dir, "Pdbbind", pdbid, f"{pdbid}_protein.pdb")
     native_ca = extract_ca_from_pdb(native_pdb, start, end)
 
-    tried = []
-    refined_ca = None
+    with open(top50_path, "r", encoding="utf-8") as f:
+        items = json.load(f)
+
+    decoded_df = decode_all_and_rmsd(items, native_ca, out_jsonl=os.path.join(out_dir, "decoded.jsonl"))
+    if len(decoded_df) == 0:
+        raise RuntimeError("No decodable samples with RMSD.")
+
+    decoded_sorted = decoded_df.sort_values("rmsd", ascending=True).reset_index(drop=True)
+
+    # Stage 1: top-K iterative refine with decreasing K
+    refined_ca, attempts_topk, ok = topk_iterative_refine(decoded_sorted, native_ca, out_dir, mode, stop_thr, enable_polish)
+
+    attempts_all = list(attempts_topk)
+    converged = bool(ok)
     final_rmsd = None
-    converged = False
 
-    for round_id in range(max_rounds):
-        refined_ca, report = try_refine(cluster_df, out_dir, mode, search_round=round_id, enable_polish=enable_polish)
-        r = compute_rmsd_to_native(refined_ca, native_ca)
-        tried.append({
-            "round": round_id,
-            "rmsd": float(r),
-            **report
-        })
-        with open(os.path.join(out_dir, f"rmsd_round{round_id}.json"), "w", encoding="utf-8") as f:
-            json.dump(tried[-1], f, indent=2)
-        if r < 2.0:
-            final_rmsd = float(r)
-            converged = True
-            break
+    if converged:
+        final_rmsd = float(compute_rmsd_to_native(refined_ca, native_ca))
+    else:
+        # Stage 2: GROUP fallback (exhaustive subsets)
+        refined_ca2, attempts_fb, ok2 = group_fallback_refine(
+            decoded_sorted, native_ca, out_dir, mode, stop_thr, enable_polish, fallback_top=fallback_top
+        )
+        attempts_all.extend(attempts_fb)
+        converged = bool(ok2)
+        refined_ca = refined_ca2
+        final_rmsd = float(compute_rmsd_to_native(refined_ca, native_ca))
 
-    if final_rmsd is None:
-        final_rmsd = float(tried[-1]["rmsd"])
-
+    # Save final report
     with open(os.path.join(out_dir, "rmsd.json"), "w", encoding="utf-8") as f:
         json.dump({
             "pdb_id": pdbid,
             "residue_range": f"{start}-{end}",
             "final_rmsd": final_rmsd,
             "converged": converged,
-            "attempts": tried
+            "attempts": attempts_all
         }, f, indent=2)
-
-    if "weights" in tried[-1]:
-        with open(os.path.join(out_dir, "weights.json"), "w", encoding="utf-8") as f:
-            json.dump({"weights": tried[-1]["weights"]}, f, indent=2)
 
     return {
         "pdb_id": pdbid,
@@ -249,6 +407,7 @@ def process_one_file(top50_path: str, bench_map: Dict[str, Tuple[int, int, int]]
         "converged": converged
     }
 
+
 # ------------------------------
 # Main
 # ------------------------------
@@ -257,9 +416,10 @@ def main():
     ap.add_argument("--pred_dir", default="predictions")
     ap.add_argument("--dataset_dir", default="dataset")
     ap.add_argument("--out_dir", default="output_final")
-    ap.add_argument("--mode", default="standard", choices=["fast", "standard", "premium"])
-    ap.add_argument("--max_rounds", type=int, default=5)  # up to last aggressive schedule
-    ap.add_argument("--polish", action="store_true", help="Enable local energy polish (aggressive)")
+    ap.add_argument("--mode", default="premium", choices=["fast", "standard", "premium"])
+    ap.add_argument("--polish", action="store_true", help="Enable local energy polish")
+    ap.add_argument("--fallback_top", type=int, default=12, help="Top-M pool for exhaustive group fallback")
+    ap.add_argument("--stop", type=float, default=2.5, help="Early stop RMSD threshold (Å)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -274,9 +434,9 @@ def main():
     rows = []
     for fp in files:
         try:
-            row = process_one_file(
+            row = process_one_target(
                 fp, bench_map, args.dataset_dir, args.out_dir,
-                mode=args.mode, max_rounds=args.max_rounds, enable_polish=args.polish
+                mode=args.mode, stop_thr=args.stop, enable_polish=args.polish, fallback_top=args.fallback_top
             )
             rows.append(row)
         except Exception as e:
@@ -296,4 +456,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
