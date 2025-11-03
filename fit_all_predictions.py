@@ -4,36 +4,30 @@
 # @Email : yzhan135@kent.edu
 # @File:fit_all_predictions.py.py
 
-# fit_all_predictions.py
-# Glue script: read top50 -> pick top10 by score -> decode -> refine -> RMSD vs. PDBbind fragment
-# Usage:
-#   python fit_all_predictions.py --pred_dir predictions --dataset_dir dataset --out_dir output_final --mode standard
 
 import argparse
 import glob
 import json
 import math
 import os
-import random
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 
-# === import your provided modules ===
+# import user-provided modules
 from qsadpp.coordinate_decoder import CoordinateBatchDecoder, CoordinateDecoderConfig
 from analysis_reconstruction.structure_refine import (
     RefineConfig, StructureRefiner, align_to_reference, rmsd as rmsd_fn
 )
 
 # ------------------------------
-# Small PDB / benchmark helpers
+# Benchmark / PDB helpers
 # ------------------------------
 def read_benchmark_ranges(path: str) -> Dict[str, Tuple[int, int, int]]:
     """Return map: pdbid -> (start_resi, end_resi, L)."""
     m = {}
     df = pd.read_csv(path, sep=r"\s+", engine="python")
-    # Columns expected: pdb_id, Residue_sequence, Sequence_length, Residues (like '47-59')
     for _, row in df.iterrows():
         pid = str(row["pdb_id"]).strip()
         rng = str(row["Residues"]).strip()
@@ -41,7 +35,6 @@ def read_benchmark_ranges(path: str) -> Dict[str, Tuple[int, int, int]]:
             a, b = rng.split("-")
             a, b = int(a), int(b)
         else:
-            # fallback: treat single number as [n, n]
             a = b = int(rng)
         L = int(row.get("Sequence_length", b - a + 1))
         m[pid] = (a, b, L)
@@ -57,9 +50,7 @@ def extract_ca_from_pdb(pdb_path: str, start: int, end: int) -> np.ndarray:
         for line in f:
             if not line.startswith("ATOM"):
                 continue
-            # Columns: residue sequence number at 23-26 (1-based PDB format)
-            atom_name = line[12:16]
-            if atom_name.strip() != "CA":
+            if line[12:16].strip() != "CA":
                 continue
             try:
                 resi = int(line[22:26])
@@ -69,19 +60,17 @@ def extract_ca_from_pdb(pdb_path: str, start: int, end: int) -> np.ndarray:
                 x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
                 coords.append([x, y, z])
     if len(coords) == 0:
-        raise RuntimeError(f"No CA found in range {start}-{end} for {pdb_path}")
+        raise RuntimeError(f"No CA in range {start}-{end} for {pdb_path}")
     return np.asarray(coords, dtype=float)
 
-
 # ------------------------------
-# Decoding + Refinement helpers
+# Decode + build cluster
 # ------------------------------
 def decode_top10(df10: pd.DataFrame, out_jsonl: str) -> pd.DataFrame:
     """
-    Decode 10 rows into main_positions using your CoordinateBatchDecoder.
-    We set side_chain_hot_vector to all-False with length = len(sequence).
+    Use CoordinateBatchDecoder to decode top10 into 'main_positions'.
+    side_chain_hot_vector: all False (length=len(sequence)).
     """
-    # All rows for the same pdbid share the same sequence
     seq = str(df10.iloc[0]["sequence"]).strip()
     L = len(seq)
     cfg = CoordinateDecoderConfig(
@@ -95,56 +84,52 @@ def decode_top10(df10: pd.DataFrame, out_jsonl: str) -> pd.DataFrame:
         max_rows=None,
     )
     dec = CoordinateBatchDecoder(cfg)
-    summary = dec.decode_and_save(df10[["bitstring", "sequence", "score"]].copy())
-    # Load back decoded jsonl to a DataFrame
+    dec.decode_and_save(df10[["bitstring", "sequence", "score"]].copy())
+
+    # load back
     recs = []
-    if os.path.exists(cfg.output_path):
-        with open(cfg.output_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
+    with open(cfg.output_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
                 recs.append(json.loads(line))
     out = pd.DataFrame.from_records(recs)
-    # attach score for weighting
     out = out.merge(df10[["bitstring", "score"]], on="bitstring", how="left")
     return out
 
 
 def build_cluster_df(decoded_df: pd.DataFrame) -> pd.DataFrame:
-    """Adapt columns for StructureRefiner: positions_col='main_positions', energy_key='score'."""
-    # Ensure lists are serialized consistently
     return decoded_df[["sequence", "main_positions", "score"]].copy()
 
-
+# ------------------------------
+# RMSD helpers
+# ------------------------------
 def compute_rmsd_to_native(pred_ca: np.ndarray, native_ca: np.ndarray) -> float:
-    """Align with Kabsch and compute RMSD (trim to the common length if needed)."""
     L = min(pred_ca.shape[0], native_ca.shape[0])
     A = native_ca[:L]
     B = pred_ca[:L]
     B_aln = align_to_reference(A, B)
     return rmsd_fn(A, B_aln)
 
+# ------------------------------
+# Aggressive refine attempts
+# ------------------------------
+AGGRESSIVE_SCHEDULES = [
+    # broaden sample, stronger smoothing, longer projection, looser min separation
+    dict(top_energy_pct=0.30, proj_smooth_strength=0.015, min_separation=2.8,
+         target_ca_distance=3.75, subsample_max=512, proj_iters=16),
+    dict(top_energy_pct=0.40, proj_smooth_strength=0.025, min_separation=2.7,
+         target_ca_distance=3.70, subsample_max=640, proj_iters=18),
+    dict(top_energy_pct=0.50, proj_smooth_strength=0.030, min_separation=2.7,
+         target_ca_distance=3.80, subsample_max=768, proj_iters=20),
+    dict(top_energy_pct=0.60, proj_smooth_strength=0.040, min_separation=2.6,
+         target_ca_distance=3.65, subsample_max=1024, proj_iters=22),
+    dict(top_energy_pct=0.60, proj_smooth_strength=0.050, min_separation=2.6,
+         target_ca_distance=3.90, subsample_max=1024, proj_iters=24),
+]
 
 def try_refine(cluster_df: pd.DataFrame, out_dir: str, mode: str,
-               search_round: int = 0) -> Tuple[np.ndarray, Dict]:
-    """
-    Run StructureRefiner once with a parameter set (optionally adjusted by search_round).
-    Returns refined_ca and report.
-    """
-    # Heuristic schedule for auto-search
-    schedules = [
-        dict(top_energy_pct=0.15, proj_smooth_strength=0.005, min_separation=2.8,
-             target_ca_distance=3.8, subsample_max=256),
-        dict(top_energy_pct=0.20, proj_smooth_strength=0.008, min_separation=2.9,
-             target_ca_distance=3.75, subsample_max=384),
-        dict(top_energy_pct=0.25, proj_smooth_strength=0.010, min_separation=2.7,
-             target_ca_distance=3.85, subsample_max=512),
-        dict(top_energy_pct=0.30, proj_smooth_strength=0.015, min_separation=2.9,
-             target_ca_distance=3.70, subsample_max=512),
-        dict(top_energy_pct=0.35, proj_smooth_strength=0.020, min_separation=3.0,
-             target_ca_distance=3.80, subsample_max=640),
-    ]
-    sch = schedules[min(search_round, len(schedules) - 1)]
+               search_round: int, enable_polish: bool) -> Tuple[np.ndarray, Dict]:
+    sch = AGGRESSIVE_SCHEDULES[min(search_round, len(AGGRESSIVE_SCHEDULES) - 1)]
 
     cfg = RefineConfig(
         subsample_max=sch["subsample_max"],
@@ -154,59 +139,66 @@ def try_refine(cluster_df: pd.DataFrame, out_dir: str, mode: str,
         refine_mode=mode,
         positions_col="main_positions",
         vectors_col="main_vectors",
-        energy_key="score",              # treat 'score' as energy
+        energy_key="score",                 # score作为能量
         sequence_col="sequence",
-        energy_weights={"score": 1.0},   # weight by score
+        energy_weights={"score": 2.5},      # 更偏置的样本权重
         proj_smooth_strength=sch["proj_smooth_strength"],
-        proj_iters=8,
+        proj_iters=sch["proj_iters"],
         target_ca_distance=sch["target_ca_distance"],
         min_separation=sch["min_separation"],
+        do_local_polish=bool(enable_polish),
+        local_polish_steps=30,
+        stay_lambda=0.03,
+        step_size=0.05,
         output_dir=out_dir,
     )
     refiner = StructureRefiner(cfg)
     refiner.load_cluster_dataframe(cluster_df)
     refiner.run()
     outs = refiner.get_outputs()
-    # expose weights for saving
-    weights = getattr(refiner, "_StructureRefiner__dict__", None)
-    # safer: recompute weights using method on refiner
+
+    # weights
     try:
         w = refiner._robust_energy_weights()
         weights_dict = {"weights": w.tolist()}
     except Exception:
         weights_dict = {}
+
     refiner.save_outputs()
-    # augment report
     rep = dict(outs.get("report", {}))
     rep.update(weights_dict)
+    rep.update({
+        "round_cfg": sch,
+        "mode": mode,
+        "polish": bool(enable_polish),
+        "energy_weights": {"score": 2.5},
+    })
     return outs["refined_ca"], rep
 
-
 # ------------------------------
-# Main driver
+# Per-file driver
 # ------------------------------
 def process_one_file(top50_path: str, bench_map: Dict[str, Tuple[int, int, int]],
-                     dataset_dir: str, out_root: str, mode: str) -> Dict[str, any]:
+                     dataset_dir: str, out_root: str, mode: str,
+                     max_rounds: int, enable_polish: bool) -> Dict[str, any]:
     pdbid = os.path.basename(top50_path).split("_top50.json")[0]
     out_dir = os.path.join(out_root, pdbid)
     os.makedirs(out_dir, exist_ok=True)
 
-    # 1) load top50 and take top-10 by 'score' (ascending)
+    # load top50 and select top10 by score ascending
     with open(top50_path, "r", encoding="utf-8") as f:
         items = json.load(f)
     df = pd.DataFrame(items)
     if "score" not in df.columns:
-        # fallback: if 'score' missing, assign equal scores
         df["score"] = 0.0
     df = df.sort_values("score", ascending=True).reset_index(drop=True)
     df10 = df.iloc[:10].copy()
 
-    # 2) decode
+    # decode -> cluster df
     decoded_df = decode_top10(df10, out_jsonl=os.path.join(out_dir, "decoded.jsonl"))
     cluster_df = build_cluster_df(decoded_df)
 
-    # 3) refine + auto-search if needed
-    # reference CA
+    # reference fragment
     if pdbid not in bench_map:
         raise KeyError(f"{pdbid} not found in benchmark_info.txt")
     start, end, L = bench_map[pdbid]
@@ -218,15 +210,14 @@ def process_one_file(top50_path: str, bench_map: Dict[str, Tuple[int, int, int]]
     final_rmsd = None
     converged = False
 
-    for round_id in range(5):  # up to 5 tries
-        refined_ca, report = try_refine(cluster_df, out_dir, mode, search_round=round_id)
+    for round_id in range(max_rounds):
+        refined_ca, report = try_refine(cluster_df, out_dir, mode, search_round=round_id, enable_polish=enable_polish)
         r = compute_rmsd_to_native(refined_ca, native_ca)
         tried.append({
             "round": round_id,
             "rmsd": float(r),
             **report
         })
-        # save per-round RMSD to help debugging
         with open(os.path.join(out_dir, f"rmsd_round{round_id}.json"), "w", encoding="utf-8") as f:
             json.dump(tried[-1], f, indent=2)
         if r < 2.0:
@@ -237,7 +228,6 @@ def process_one_file(top50_path: str, bench_map: Dict[str, Tuple[int, int, int]]
     if final_rmsd is None:
         final_rmsd = float(tried[-1]["rmsd"])
 
-    # 4) save final rmsd + weights
     with open(os.path.join(out_dir, "rmsd.json"), "w", encoding="utf-8") as f:
         json.dump({
             "pdb_id": pdbid,
@@ -247,11 +237,9 @@ def process_one_file(top50_path: str, bench_map: Dict[str, Tuple[int, int, int]]
             "attempts": tried
         }, f, indent=2)
 
-    # weights already saved in refiner outputs; also save a flat weights file if present
-    last = tried[-1]
-    if "weights" in last:
+    if "weights" in tried[-1]:
         with open(os.path.join(out_dir, "weights.json"), "w", encoding="utf-8") as f:
-            json.dump({"weights": last["weights"]}, f, indent=2)
+            json.dump({"weights": tried[-1]["weights"]}, f, indent=2)
 
     return {
         "pdb_id": pdbid,
@@ -261,13 +249,17 @@ def process_one_file(top50_path: str, bench_map: Dict[str, Tuple[int, int, int]]
         "converged": converged
     }
 
-
+# ------------------------------
+# Main
+# ------------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pred_dir", default="predictions")
     ap.add_argument("--dataset_dir", default="dataset")
     ap.add_argument("--out_dir", default="output_final")
     ap.add_argument("--mode", default="standard", choices=["fast", "standard", "premium"])
+    ap.add_argument("--max_rounds", type=int, default=5)  # up to last aggressive schedule
+    ap.add_argument("--polish", action="store_true", help="Enable local energy polish (aggressive)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -282,7 +274,10 @@ def main():
     rows = []
     for fp in files:
         try:
-            row = process_one_file(fp, bench_map, args.dataset_dir, args.out_dir, args.mode)
+            row = process_one_file(
+                fp, bench_map, args.dataset_dir, args.out_dir,
+                mode=args.mode, max_rounds=args.max_rounds, enable_polish=args.polish
+            )
             rows.append(row)
         except Exception as e:
             rows.append({
@@ -294,7 +289,6 @@ def main():
                 "error": str(e)
             })
 
-    # summary.csv
     df = pd.DataFrame(rows)
     df.to_csv(os.path.join(args.out_dir, "summary.csv"), index=False)
     print(df)
@@ -302,3 +296,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
