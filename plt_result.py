@@ -1,263 +1,321 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# --*-- coding: utf-8 --*--
+# @time: 2025/11/06
+# @Author : Yuqi Zhang
+# @File : plot_rmsd_results.py
+#
+# Description:
+#   Read merged RMSD CSV and generate multiple publication-ready figures:
+#     1) Grouped bar per pdb_id (QSAD/AF3/ColabFold/VQE)
+#     2) Boxplots by method
+#     3) ECDF curves by method
+#     4) Scatter vs QSAD (with y=x reference)
+#     5) Delta bar (method - QSAD) per pdb_id
+#   Also writes summary statistics (mean/median/std/count/win_rate_vs_qsad).
+#
+# Notes:
+#   - Uses matplotlib only, no seaborn.
+#   - Does not force specific colors; lets matplotlib choose defaults.
+#   - Handles missing values gracefully.
+#   - If too many pdb_ids, use --top_n to limit the grouped bar plot.
 
-"""
-RMSD plots with:
-- Robust ID normalization to reduce NaNs (strip + lowercase)
-- Custom colors ONLY for bar charts (QSAD neon yellow-green; AF3 dark brown; VQE deep blue; ColabFold dark gray)
-- Proper tick handling (no warnings) and improved grid aesthetics
-- Optional hatch on missing bars (can toggle with SHOW_MISSING_HATCH)
-"""
-
-import os
-from typing import Dict, Tuple, List
-
+import argparse
+from pathlib import Path
+from typing import List, Dict
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 
-# ----------------------------
-# Files
-# ----------------------------
-AF3_TXT = "output_final/af3_rmsd_summary.txt"
-COLABFOLD_TXT = "output_final/colabfold_rmsd_summary.txt"
-VQE_TXT = "output_final/vqe_rmsd_summary.txt"
-QSAD_CSV = "output_final/qsad_rmsd_summary.csv"
 
-OUT_DIR = "final_fig"
-os.makedirs(OUT_DIR, exist_ok=True)
-
-plt.rcParams["figure.dpi"] = 140
-plt.rcParams["savefig.dpi"] = 300
-plt.rcParams["font.size"] = 10
-plt.rcParams["axes.grid"] = True
-
-# ----------------------------
-# Bar colors (bars only)
-# ----------------------------
-BAR_COLORS = {
-    "QSAD": "#CCFF00",      # fluorescent yellow-green
-    "AF3": "#5B3A29",       # dark brown
-    "VQE": "#003366",       # deep blue
-    "ColabFold": "#4A4A4A", # dark gray
+METHOD_COLUMNS = ["qsad_rmsd", "af3_rmsd", "colabfold_rmsd", "vqe_rmsd"]
+METHOD_LABELS = {
+    "qsad_rmsd": "QSAD",
+    "af3_rmsd": "AF3",
+    "colabfold_rmsd": "ColabFold",
+    "vqe_rmsd": "VQE",
 }
-EDGE_KW = dict(edgecolor="black", linewidth=0.7)
-SHOW_MISSING_HATCH = True  # set False to hide the hatch rectangles for missing values
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def _norm_pid(s: str) -> str:
-    return s.strip().lower()
 
-def load_tab_txt(path: str) -> Dict[str, float]:
-    d: Dict[str, float] = {}
-    if not os.path.exists(path):
-        return d
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "\t" not in line:
-                continue
-            pid, val = line.split("\t", 1)
-            try:
-                d[_norm_pid(pid)] = float(val.strip())
-            except Exception:
-                pass
-    return d
+def ecdf_values(x: np.ndarray):
+    """Return ECDF x_sorted, y for a 1D array (drop NaNs)."""
+    x = np.array(x, dtype=float)
+    x = x[~np.isnan(x)]
+    if x.size == 0:
+        return np.array([]), np.array([])
+    xs = np.sort(x)
+    ys = np.arange(1, xs.size + 1) / xs.size
+    return xs, ys
 
-def load_qsad_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    # normalize columns
-    df = df.rename(columns={"final_rmsd": "QSAD"})
-    df["pdb_id_norm"] = df["pdb_id"].astype(str).map(_norm_pid)
-    return df[["pdb_id", "pdb_id_norm", "sequence", "QSAD"]].copy()
 
-def savefig(out_path_base: str):
-    png = f"{out_path_base}.png"
-    pdf = f"{out_path_base}.pdf"
-    plt.tight_layout()
-    plt.savefig(png, bbox_inches="tight")
-    plt.savefig(pdf, bbox_inches="tight")
-    print(f"[saved] {png}\n[saved] {pdf}")
+def summary_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute mean/median/std/count & win_rate_vs_qsad (≤ QSAD) per method."""
+    stats = []
+    for col in METHOD_COLUMNS:
+        series = pd.to_numeric(df[col], errors="coerce")
+        s = {
+            "method": METHOD_LABELS[col],
+            "mean": series.mean(),
+            "median": series.median(),
+            "std": series.std(ddof=1),
+            "count": series.count(),
+        }
+        if col != "qsad_rmsd":
+            paired = df[["qsad_rmsd", col]].copy()
+            paired = paired.apply(pd.to_numeric, errors="coerce")
+            paired = paired.dropna()
+            if len(paired) > 0:
+                win_rate = (paired[col] <= paired["qsad_rmsd"]).mean()
+            else:
+                win_rate = np.nan
+            s["win_rate_vs_qsad"] = win_rate
+        else:
+            s["win_rate_vs_qsad"] = np.nan
+        stats.append(s)
+    return pd.DataFrame(stats)
 
-# ----------------------------
-# Plots
-# ----------------------------
-def grouped_bar_all(df: pd.DataFrame, methods: List[str]):
-    # sort by QSAD
-    plot_df = df.sort_values("QSAD", na_position="last").reset_index(drop=True)
-    pdbs = plot_df["pdb_id"].tolist()
-    n = len(pdbs)
 
+def plot_grouped_bar(df: pd.DataFrame, out_dir: Path, top_n: int = 0):
+    """Grouped bar for per-pdb_id comparison across methods."""
+    data = df.copy()
+    # Optionally limit number of examples for readability
+    if top_n and top_n > 0:
+        data = data.head(top_n)
+
+    pdb_ids = data["pdb_id"].astype(str).tolist()
+    n = len(pdb_ids)
+    if n == 0:
+        print("[WARN] No rows to plot for grouped bar.")
+        return
+
+    # Prepare matrix values aligned to METHOD_COLUMNS
+    vals = []
+    for col in METHOD_COLUMNS:
+        vals.append(pd.to_numeric(data[col], errors="coerce").to_numpy())
+    vals = np.vstack(vals)  # shape: (4, n)
+
+    # Bar layout
     x = np.arange(n)
-    width = max(0.08, min(0.8 / max(1, len(methods)), 0.2))
+    m = len(METHOD_COLUMNS)
+    width = min(0.8 / m, 0.2)
 
-    fig = plt.figure(figsize=(max(12, 0.35 * n), 6))
-    ax = plt.gca()
-    ax.set_axisbelow(True)
-    ax.grid(axis="y", linestyle=":", alpha=0.4)
+    fig = plt.figure(figsize=(max(10, n * 0.5), 6))
+    for i, col in enumerate(METHOD_COLUMNS):
+        shift = (i - (m - 1) / 2) * (width + 0.02)
+        plt.bar(x + shift, vals[i], width=width, label=METHOD_LABELS[col])
 
-    # draw bars (with consistent colors) and optional hatch rectangles for missing
-    for i, meth in enumerate(methods):
-        vals = plot_df[meth].to_numpy() if meth in plot_df.columns else np.full(n, np.nan)
-        xpos = x + (i - (len(methods) - 1) / 2) * width
-
-        # real bars
-        mask = ~np.isnan(vals)
-        if mask.any():
-            ax.bar(
-                xpos[mask], vals[mask], width=width,
-                color=BAR_COLORS.get(meth, "#999999"),
-                **EDGE_KW, label=meth if i == 0 else None
-            )
-        # hatch rectangles for missing (to keep group visual consistency)
-        if SHOW_MISSING_HATCH:
-            m2 = np.isnan(vals)
-            if m2.any():
-                ax.bar(
-                    xpos[m2], np.zeros(m2.sum()), width=width,
-                    facecolor="none", hatch="////", **EDGE_KW
-                )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(pdbs, rotation=90)
-    ax.set_ylabel("RMSD (Å)")
-    ax.set_title("RMSD across methods (QSAD set)")
-
-    handles = [Patch(facecolor=BAR_COLORS[m], **EDGE_KW) for m in methods]
-    labels = methods
-    if SHOW_MISSING_HATCH:
-        handles.append(Patch(facecolor="white", edgecolor="black", hatch="////"))
-        labels = labels + ["missing"]
-    ax.legend(handles, labels, ncols=min(5, len(labels)))
-
-    savefig(os.path.join(OUT_DIR, "bar_all_methods"))
-    plt.close()
-
-def improvement_bar(df: pd.DataFrame, other: str, base: str = "QSAD"):
-    if other not in df.columns or base not in df.columns:
-        return
-    sub = df[["pdb_id", base, other]].dropna().sort_values(base).reset_index(drop=True)
-    if sub.empty:
-        return
-
-    diff = sub[other].to_numpy() - sub[base].to_numpy()
-    x = np.arange(len(sub))
-
-    fig = plt.figure(figsize=(max(10, 0.25 * len(sub)), 4))
-    ax = plt.gca()
-    ax.set_axisbelow(True)
-    ax.grid(axis="y", linestyle=":", alpha=0.4)
-
-    ax.bar(
-        x, diff,
-        color=BAR_COLORS.get(other, "#999999"),
-        **EDGE_KW
-    )
-    ax.axhline(0, color="k", linewidth=1)
-    ax.set_xticks(x)
-    ax.set_xticklabels(sub["pdb_id"].tolist(), rotation=90)
-    ax.set_ylabel(f"{other} - {base} (Å)")
-    ax.set_title(f"Improvement vs {other} (positive → {base} better)")
-
-    handles = [Patch(facecolor=BAR_COLORS[other], **EDGE_KW)]
-    ax.legend(handles, [other])
-
-    savefig(os.path.join(OUT_DIR, f"improvement_{other.lower()}_vs_{base.lower()}"))
-    plt.close()
-
-def scatter_vs_qsad(df: pd.DataFrame, other: str, base: str = "QSAD"):
-    if other not in df.columns or base not in df.columns:
-        return
-    sub = df[[base, other]].dropna()
-    if sub.empty:
-        return
-
-    xmin = float(min(sub[base].min(), sub[other].min()))
-    xmax = float(max(sub[base].max(), sub[other].max()))
-    pad = 0.1 * (xmax - xmin) if xmax > xmin else 0.5
-    lo, hi = xmin - pad, xmax + pad
-
-    plt.figure(figsize=(5, 5))
-    plt.scatter(sub[base], sub[other], s=20)
-    plt.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1, color="black")
-    plt.xlim(lo, hi)
-    plt.ylim(lo, hi)
-    plt.xlabel(f"{base} RMSD (Å)")
-    plt.ylabel(f"{other} RMSD (Å)")
-    plt.title(f"{base} vs {other} RMSD")
-    savefig(os.path.join(OUT_DIR, f"scatter_{base.lower()}_vs_{other.lower()}"))
-    plt.close()
-
-def boxplot_by_method(df: pd.DataFrame, methods: List[str]):
-    vals, labels = [], []
-    for m in methods:
-        if m in df.columns and df[m].notna().sum() > 0:
-            vals.append(df[m].dropna().values)
-            labels.append(m)
-    if not vals:
-        return
-    plt.figure(figsize=(1.8 * len(labels), 5))
-    plt.boxplot(vals, tick_labels=labels, showfliers=True, patch_artist=False)  # modern arg
+    plt.xticks(x, pdb_ids, rotation=90)
     plt.ylabel("RMSD (Å)")
-    plt.title("RMSD distribution by method")
-    savefig(os.path.join(OUT_DIR, "boxplot_rmsd_by_method"))
-    plt.close()
+    plt.title("RMSD per PDB (Grouped Bar)")
+    plt.legend()
+    plt.tight_layout()
 
-def ecdf(data: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    x = np.sort(data)
-    y = np.arange(1, len(x) + 1) / len(x)
-    return x, y
+    out_png = out_dir / "bar_grouped_per_pdb.png"
+    out_pdf = out_dir / "bar_grouped_per_pdb.pdf"
+    fig.savefig(out_png, dpi=300)
+    fig.savefig(out_pdf)
+    plt.close(fig)
+    print(f"[Saved] {out_png}")
+    print(f"[Saved] {out_pdf}")
 
-def ecdf_plot(df: pd.DataFrame, methods: List[str]):
-    available = [m for m in methods if m in df.columns and df[m].notna().sum() > 0]
-    if not available:
+
+def plot_boxplots(df: pd.DataFrame, out_dir: Path):
+    """Boxplots per method."""
+    data = [pd.to_numeric(df[col], errors="coerce").dropna().values for col in METHOD_COLUMNS]
+    labels = [METHOD_LABELS[c] for c in METHOD_COLUMNS]
+
+    if all(len(d) == 0 for d in data):
+        print("[WARN] No data for boxplots.")
         return
-    plt.figure(figsize=(6, 5))
-    for m in available:
-        x, y = ecdf(df[m].dropna().values)
-        plt.plot(x, y, label=m)
+
+    fig = plt.figure(figsize=(8, 5))
+    plt.boxplot(data, labels=labels, showmeans=True)
+    plt.ylabel("RMSD (Å)")
+    plt.title("RMSD Distribution by Method (Boxplot)")
+    plt.tight_layout()
+
+    out_png = out_dir / "boxplot_by_method.png"
+    out_pdf = out_dir / "boxplot_by_method.pdf"
+    fig.savefig(out_png, dpi=300)
+    fig.savefig(out_pdf)
+    plt.close(fig)
+    print(f"[Saved] {out_png}")
+    print(f"[Saved] {out_pdf}")
+
+
+def plot_ecdf(df: pd.DataFrame, out_dir: Path):
+    """ECDF per method (lower-left is better)."""
+    fig = plt.figure(figsize=(7, 5))
+
+    plotted_any = False
+    for col in METHOD_COLUMNS:
+        xs, ys = ecdf_values(pd.to_numeric(df[col], errors="coerce").values)
+        if xs.size == 0:
+            continue
+        plt.plot(xs, ys, label=METHOD_LABELS[col])
+        plotted_any = True
+
+    if not plotted_any:
+        print("[WARN] No data for ECDF.")
+        plt.close(fig)
+        return
+
     plt.xlabel("RMSD (Å)")
     plt.ylabel("ECDF")
-    plt.title("ECDF of RMSD by method")
+    plt.title("ECDF of RMSD by Method")
+    plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
     plt.legend()
-    savefig(os.path.join(OUT_DIR, "ecdf_rmsd_by_method"))
-    plt.close()
+    plt.tight_layout()
 
-# ----------------------------
-# Main
-# ----------------------------
+    out_png = out_dir / "ecdf_by_method.png"
+    out_pdf = out_dir / "ecdf_by_method.pdf"
+    fig.savefig(out_png, dpi=300)
+    fig.savefig(out_pdf)
+    plt.close(fig)
+    print(f"[Saved] {out_png}")
+    print(f"[Saved] {out_pdf}")
+
+
+def plot_scatter_vs_qsad(df: pd.DataFrame, out_dir: Path):
+    """Scatter of each method vs QSAD with y=x reference."""
+    base = pd.to_numeric(df["qsad_rmsd"], errors="coerce")
+    methods = [c for c in METHOD_COLUMNS if c != "qsad_rmsd"]
+
+    for col in methods:
+        comp = pd.to_numeric(df[col], errors="coerce")
+        valid = ~(base.isna() | comp.isna())
+        x = base[valid].values
+        y = comp[valid].values
+
+        fig = plt.figure(figsize=(5.5, 5.5))
+        if x.size == 0:
+            print(f"[WARN] No paired data for scatter {METHOD_LABELS[col]} vs QSAD.")
+            plt.close(fig)
+            continue
+
+        plt.scatter(x, y, s=25, alpha=0.8, edgecolors="none")
+        lim_max = np.nanmax([x.max(), y.max()])
+        lim_min = np.nanmin([x.min(), y.min()])
+        pad = 0.1 * (lim_max - lim_min if lim_max > lim_min else 1.0)
+        lo = max(0.0, lim_min - pad)
+        hi = lim_max + pad
+        plt.plot([lo, hi], [lo, hi])  # y = x
+
+        plt.xlabel("QSAD RMSD (Å)")
+        plt.ylabel(f"{METHOD_LABELS[col]} RMSD (Å)")
+        plt.title(f"{METHOD_LABELS[col]} vs QSAD")
+        plt.xlim(lo, hi)
+        plt.ylim(lo, hi)
+        plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+        plt.tight_layout()
+
+        out_png = out_dir / f"scatter_{METHOD_LABELS[col].lower()}_vs_qsad.png"
+        out_pdf = out_dir / f"scatter_{METHOD_LABELS[col].lower()}_vs_qsad.pdf"
+        fig.savefig(out_png, dpi=300)
+        fig.savefig(out_pdf)
+        plt.close(fig)
+        print(f"[Saved] {out_png}")
+        print(f"[Saved] {out_pdf}")
+
+
+def plot_delta_bar(df: pd.DataFrame, out_dir: Path, top_n: int = 0):
+    """
+    Bar plot of (method - QSAD) per pdb_id.
+    Positive: method worse than QSAD; Negative: method better than QSAD.
+    """
+    data = df.copy()
+    if top_n and top_n > 0:
+        data = data.head(top_n)
+
+    base = pd.to_numeric(data["qsad_rmsd"], errors="coerce")
+    pdb_ids = data["pdb_id"].astype(str).tolist()
+    n = len(pdb_ids)
+    if n == 0:
+        print("[WARN] No rows to plot for delta bar.")
+        return
+
+    deltas = []
+    labels = []
+    for col in ["af3_rmsd", "colabfold_rmsd", "vqe_rmsd"]:
+        comp = pd.to_numeric(data[col], errors="coerce")
+        delta = comp - base
+        deltas.append(delta.to_numpy())
+        labels.append(METHOD_LABELS[col])
+
+    x = np.arange(n)
+    m = len(deltas)
+    width = min(0.8 / m, 0.25)
+
+    fig = plt.figure(figsize=(max(10, n * 0.5), 6))
+    for i in range(m):
+        shift = (i - (m - 1) / 2) * (width + 0.02)
+        plt.bar(x + shift, deltas[i], width=width, label=labels[i])
+
+    plt.axhline(0.0)
+    plt.xticks(x, pdb_ids, rotation=90)
+    plt.ylabel("ΔRMSD (method − QSAD) (Å)")
+    plt.title("Per-PDB ΔRMSD relative to QSAD")
+    plt.legend()
+    plt.tight_layout()
+
+    out_png = out_dir / "delta_bar_vs_qsad.png"
+    out_pdf = out_dir / "delta_bar_vs_qsad.pdf"
+    fig.savefig(out_png, dpi=300)
+    fig.savefig(out_pdf)
+    plt.close(fig)
+    print(f"[Saved] {out_png}")
+    print(f"[Saved] {out_pdf}")
+
+
 def main():
-    af3 = load_tab_txt(AF3_TXT)
-    colab = load_tab_txt(COLABFOLD_TXT)
-    vqe = load_tab_txt(VQE_TXT)
-    qsad_df = load_qsad_csv(QSAD_CSV)
+    parser = argparse.ArgumentParser(description="Plot RMSD comparisons from merged CSV.")
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        default=Path("result_summary/result_rmsd_merged.csv"),
+        help="Path to merged RMSD CSV.",
+    )
+    parser.add_argument(
+        "--out_dir",
+        type=Path,
+        default=Path("result_summary/figs"),
+        help="Output directory for figures.",
+    )
+    parser.add_argument(
+        "--top_n",
+        type=int,
+        default=0,
+        help="Limit number of PDBs for per-PDB bar plots (0 means all).",
+    )
+    args = parser.parse_args()
 
-    # join on normalized ids
-    merged = qsad_df.copy()
-    merged["AF3"] = merged["pdb_id_norm"].map(af3).astype(float)
-    merged["ColabFold"] = merged["pdb_id_norm"].map(colab).astype(float)
-    merged["VQE"] = merged["pdb_id_norm"].map(vqe).astype(float)
+    if not args.csv.exists():
+        raise FileNotFoundError(f"Merged CSV not found: {args.csv}")
 
-    merged_out = os.path.join(OUT_DIR, "merged_rmsd.csv")
-    merged.drop(columns=["pdb_id_norm"]).to_csv(merged_out, index=False)
-    print(f"[saved] {merged_out}")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    methods = ["QSAD", "VQE", "AF3", "ColabFold"]
+    df = pd.read_csv(args.csv)
+    # Normalize column names
+    df.columns = [c.strip().lower() for c in df.columns]
 
-    grouped_bar_all(merged.drop(columns=["pdb_id_norm"]), methods)
-    for other in ["AF3", "ColabFold", "VQE"]:
-        improvement_bar(merged.drop(columns=["pdb_id_norm"]), other, base="QSAD")
+    # Basic validations
+    for col in ["pdb_id"] + METHOD_COLUMNS:
+        if col not in df.columns:
+            raise ValueError(f"Missing column in CSV: {col}")
 
-    for other in ["AF3", "ColabFold", "VQE"]:
-        scatter_vs_qsad(merged, other, base="QSAD")
+    # Summary stats
+    stats_df = summary_stats(df)
+    stats_out = args.out_dir / "summary_stats.csv"
+    stats_df.to_csv(stats_out, index=False)
+    print(f"[Saved] {stats_out}")
 
-    boxplot_by_method(merged, methods)
-    ecdf_plot(merged, methods)
+    # Plots
+    plot_grouped_bar(df, args.out_dir, top_n=args.top_n)
+    plot_boxplots(df, args.out_dir)
+    plot_ecdf(df, args.out_dir)
+    plot_scatter_vs_qsad(df, args.out_dir)
+    plot_delta_bar(df, args.out_dir, top_n=args.top_n)
 
-    print("[done] All figures saved to:", OUT_DIR)
+    print("[Done] All figures saved.")
+
 
 if __name__ == "__main__":
     main()
