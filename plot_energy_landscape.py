@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # @file: plot_landscape_light_en.py
-# @desc: Lightweight O(n) landscape visualization with sharpened funnel bottom.
+# @desc: Lightweight O(n) landscape visualization where z increases with distance from the global minimum.
 #        Reads e_results/1m7y/energies.jsonl
 #        Outputs: result_summary/landscape/{funnel_3d,density_2d}.png/pdf
 
@@ -104,48 +104,56 @@ def main():
     if tau <= 1e-12:
         tau = float(np.percentile(dE, 75) - np.percentile(dE, 25) + 1e-12)
     Ehat = dE / (median_absolute_deviation(dE) + 1e-12)
-    rank_norm = (np.argsort(np.argsort(E)) / (n - 1)).astype(float)
 
-    # Single-source structural distance to the lowest-energy sample
+    # Single-source structural distance to the global minimum
     bs_min = bitstrings[idx_min]
     use_rmsd = positions[idx_min] is not None and all(p is not None for p in positions)
     if use_rmsd:
         Ps = equalize_lengths([p for p in positions if p is not None])
         Pmin = Ps[idx_min]
-        dist_to_min = np.array([rmsd_after_kabsch(Pmin, Ps[i]) for i in range(n)], dtype=float)
-        d_med = np.median(dist_to_min)
-        d_mad = median_absolute_deviation(dist_to_min)
-        d_scale = (dist_to_min - d_med) / (d_mad + 1e-12)
+        dist_to_min_raw = np.array([rmsd_after_kabsch(Pmin, Ps[i]) for i in range(n)], dtype=float)
+        # robust to [0,1]
+        d_med = np.median(dist_to_min_raw)
+        d_mad = median_absolute_deviation(dist_to_min_raw)
+        d_scale = (dist_to_min_raw - d_med) / (d_mad + 1e-12)
         d_scale = np.clip(d_scale, 0.0, None)
-        d_scale /= (np.percentile(d_scale, 95) + 1e-12)
-        struct_to_min = d_scale
+        dist_w = d_scale / (np.percentile(d_scale, 95) + 1e-12)
     else:
-        struct_to_min = np.array([hamming_to_min(bitstrings[i], bs_min) for i in range(n)], dtype=float)
+        dist_w = np.array([hamming_to_min(bitstrings[i], bs_min) for i in range(n)], dtype=float)
 
-    struct_to_min[idx_min] = 0.0
+    dist_w[idx_min] = 0.0  # exact zero at the minimum
+    dist_w = np.clip(dist_w, 0.0, 1.0)
 
-    # Radius: energy-dominant with a small structural correction
+    # Radius (keep lightweight radial design; not required for your z requirement)
+    # Energy-dominant radius with a small structural correction
+    rank_norm = (np.argsort(np.argsort(E)) / (n - 1)).astype(float)
     a, b, p = 0.75, 0.25, 0.6
-    r = a * (rank_norm ** p) + b * struct_to_min
+    r = a * (rank_norm ** p) + b * dist_w
     r[idx_min] = 0.0
 
-    # Angle: deterministic from hash
+    # Angle from hash to spread points deterministically
     theta = np.array([stable_angle_from_hash(bs) for bs in bitstrings], dtype=float)
     x2d = r * np.cos(theta)
     y2d = r * np.sin(theta)
 
-    # ----------- sharpened funnel z -----------
-    # Nonlinear energy-to-height mapping (sharper near minimum)
+    # ---------- z mapping: energy + distance-to-min ----------
+    # Energy term: sharper near the bottom
     Z_POWER = 1.25
-    z_base = np.power(np.maximum(Ehat - Ehat.min(), 0.0) + 1e-12, Z_POWER)
+    z_energy = np.power(np.maximum(Ehat - Ehat.min(), 0.0) + 1e-12, Z_POWER)
 
-    # Rugged walls: small deterministic noise
+    # Distance lift: strictly increasing with distance from the minimum
+    # Use a smooth, convex ramp; smoothstep-like: s = d^q (q>=1). Larger q => stronger far-field lift.
+    DIST_GAIN = 0.9    # strength of distance-induced uplift
+    DIST_POWER = 1.4   # >1 emphasizes farther points; try 1.2–1.8
+    z_dist = DIST_GAIN * np.power(dist_w, DIST_POWER)
+
+    # Small ruggedness to avoid a perfectly smooth wall
     rough = np.array([((int.from_bytes(hashlib.md5(bs.encode()).digest()[8:12], 'big') / 2**32) - 0.5)
                       for bs in bitstrings], dtype=float)
-    z3d = z_base + 0.08 * rough
+    z3d = z_energy + z_dist + 0.05 * rough
 
-    # Sink the K lowest-energy structures
-    SINK_K = max(3, int(0.002 * n))  # ~0.2% of the dataset
+    # Sink the K lowest-energy structures (sharp tip)
+    SINK_K = max(3, int(0.002 * n))   # ~0.2% of the dataset
     SINK_DELTA = 0.35
     order = np.argsort(E)
     lowest_k = order[:SINK_K]
@@ -153,20 +161,10 @@ def main():
         grades = np.linspace(1.0, 0.6, len(lowest_k))
         z3d[lowest_k] -= SINK_DELTA * grades
 
-    # Lift other samples that tie (by rounded energy) with the K-th minimum
-    ROUND_DEC = 4
-    UPLIFT_SAME = 0.15
-    if SINK_K > 0:
-        Ek = np.round(E[order[SINK_K - 1]], decimals=ROUND_DEC)
-        tied = np.where(np.round(E, ROUND_DEC) == Ek)[0]
-        tied = np.setdiff1d(tied, lowest_k, assume_unique=False)
-        if tied.size > 0:
-            z3d[tied] += UPLIFT_SAME
-
     # Ensure the global minimum is strictly the lowest
     z3d[idx_min] = np.min(z3d) - 1e-6
 
-    # ----------- 3D Funnel -----------
+    # ---------- 3D plot ----------
     fig = plt.figure(figsize=(8, 7), dpi=150)
     ax = fig.add_subplot(111, projection='3d')
     sc = ax.scatter(x2d, y2d, z3d, s=6, c=E, cmap="viridis", alpha=0.9, depthshade=True)
@@ -175,7 +173,7 @@ def main():
     ax.set_title(f"3D Funnel (min-E = {Emin:.3f})")
     ax.set_xlabel("X (energy-dominant radial)")
     ax.set_ylabel("Y (hash-based angle)")
-    ax.set_zlabel("Relative Energy (z)")
+    ax.set_zlabel("Height: energy + distance-to-min")
     cbar = plt.colorbar(sc, ax=ax, shrink=0.75, pad=0.06)
     cbar.set_label("E_total")
     ax.view_init(elev=28, azim=38)
@@ -184,7 +182,7 @@ def main():
         fig.savefig(OUTDIR / f"funnel_3d.{ext}", bbox_inches="tight")
     plt.close(fig)
 
-    # ----------- 2D Density -----------
+    # ---------- 2D plot ----------
     fig = plt.figure(figsize=(7.5, 7), dpi=150)
     ax = fig.add_subplot(111)
     hb = ax.hexbin(x2d, y2d, gridsize=60, mincnt=1, cmap="Blues", linewidths=0.0)
@@ -203,9 +201,9 @@ def main():
         fig.savefig(OUTDIR / f"density_2d.{ext}", bbox_inches="tight")
     plt.close(fig)
 
-    # Save coordinates for downstream use
+    # Save coordinates
     np.savez(OUTDIR / "coords_outputs_light.npz",
-             X2d=x2d, Y2d=y2d, Z3d=z3d, E=E, idx_min=idx_min)
+             X2d=x2d, Y2d=y2d, Z3d=z3d, E=E, idx_min=idx_min, dist_to_min=dist_w)
 
     print(f"[n] {n}")
     print(f"[saved] {OUTDIR/'funnel_3d.png'}")
