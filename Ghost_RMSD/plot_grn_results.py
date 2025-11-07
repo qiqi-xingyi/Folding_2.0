@@ -76,7 +76,7 @@ def scatter_with_fit(x, y, title, xlabel, ylabel, out_path: Path):
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
+    plt.savefig(out_path, dpi=600)
     plt.close()
 
 
@@ -101,7 +101,7 @@ def plot_training_curves(rows, out_dir: Path, epoch_limit: int = 500):
     plt.title("Training Loss")
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(out_dir / "loss.png", dpi=200)
+    plt.savefig(out_dir / "loss.png", dpi=600)
     plt.close()
 
     # Validation accuracy
@@ -112,7 +112,7 @@ def plot_training_curves(rows, out_dir: Path, epoch_limit: int = 500):
     plt.title("Validation Accuracy")
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(out_dir / "val_acc.png", dpi=200)
+    plt.savefig(out_dir / "val_acc.png", dpi=600)
     plt.close()
 
     # Ranking metrics
@@ -127,7 +127,7 @@ def plot_training_curves(rows, out_dir: Path, epoch_limit: int = 500):
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(out_dir / "ranking_metrics.png", dpi=200)
+    plt.savefig(out_dir / "ranking_metrics.png", dpi=600)
     plt.close()
 
     # Mixed monitor
@@ -138,7 +138,7 @@ def plot_training_curves(rows, out_dir: Path, epoch_limit: int = 500):
     plt.title("Mixed Monitor")
     plt.grid(alpha=0.3)
     plt.tight_layout()
-    plt.savefig(out_dir / "monitor.png", dpi=200)
+    plt.savefig(out_dir / "monitor.png", dpi=600)
     plt.close()
 
 

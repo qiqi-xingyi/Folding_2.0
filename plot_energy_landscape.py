@@ -184,7 +184,7 @@ def main():
     ax.view_init(elev=28, azim=38)
     ensure_dir(OUTDIR)
     for ext in ["png", "pdf"]:
-        fig.savefig(outdir := OUTDIR / f"funnel_3d.{ext}", bbox_inches="tight")
+        fig.savefig(outdir := OUTDIR / f"funnel_3d.{ext}", bbox_inches="tight",pad_inches=0.3)
     plt.close(fig)
 
     # ---------- 2D plot ----------
