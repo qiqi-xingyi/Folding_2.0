@@ -1,32 +1,35 @@
 # -*- coding: utf-8 -*-
-# @file: plot_sampling_funnel_memorysafe.py
+# @file: plot_sampling_funnel_landmark_mds.py
 #
-# Purpose
-#   Memory-safe, distortion-free visualization of:
-#     (1) The true 2D distribution of quantum sampling bitstrings.
-#     (2) A re-ranked 3D funnel using the SAME (X,Y) coordinates.
+# Purpose:
+#   Distortion-free, memory-safe visualization of quantum sampling:
+#     (1) True 2D distribution of sampled bitstrings (top view).
+#     (2) Rank-driven 3D funnel using the SAME (X,Y) coordinates.
 #
-# Key ideas
-#   • ONE shared embedding for the union of {sampling ∪ predictions} using
-#     TruncatedSVD/PCA on the 0/1 bit matrix (no NxN distance matrix → no OOM).
-#   • Translate so rank-1 sits at (0,0); isotropically scale to [-1,1]^2.
-#   • 2D: per-point density via kNN in the embedded 2D space (+contrast tuning).
-#   • 3D: Z = -(n - rank) / (n - 1) ∈ [-1,0], rank-1 at the deepest center.
-#   • For large N, skip triangulated surface; draw a light reference cone instead.
+# Method:
+#   • Landmark-MDS on Hamming distances:
+#       - Randomly choose M "landmarks" (M << N).
+#       - Compute M×M Hamming distances and run classical MDS (scikit-learn) to 2D.
+#       - For the remaining points, use out-of-sample multilateration to place them
+#         in the same 2D space using their distances to the landmarks only.
+#   • The whole canvas is translated so rank-1 sits at the origin and then scaled
+#     isotropically to fit in [-1,1]² (no aspect distortion).
+#   • 2D figure: show sampling points colored by kNN density (contrast enhanced).
+#   • 3D figure: Z = -(n - rank)/(n - 1) ∈ [-1,0]; rank-1 at the deepest center.
 #
-# Usage
-#   python plot_sampling_funnel_memorysafe.py
-#   python plot_sampling_funnel_memorysafe.py --case 6czf \
+# Usage:
+#   python plot_sampling_funnel_landmark_mds.py
+#   python plot_sampling_funnel_landmark_mds.py --case 6czf \
 #       --sampling_csv quantum_data/6czf/samples_6czf_all_ibm.csv \
 #       --pred_csv predictions/6czf_pred.csv \
-#       --embed svd --seed 42 --k_density 20 --topk 20
+#       --landmarks 2000 --batch_size 8000 --seed 42 --topk 20
 #
-# Requirements
+# Requirements:
 #   pip install numpy pandas matplotlib scikit-learn
 #
-# Notes
-#   - Fonts: default to Arial if available.
-#   - No seaborn used; pure matplotlib.
+# Notes:
+#   - No seaborn. Fonts set to Arial if available.
+#   - For very large N, keep landmarks 1–5k; memory scales with M² (float32).
 
 import argparse
 from pathlib import Path
@@ -35,7 +38,7 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
-from sklearn.decomposition import TruncatedSVD, PCA
+from sklearn.manifold import MDS
 from sklearn.neighbors import NearestNeighbors
 
 # ---------- Global style ----------
@@ -49,11 +52,9 @@ plt.rcParams.update({
     "ytick.labelsize": 14,
     "figure.dpi": 150,
 })
-
 CMAP_BLUES = "Blues"
 CENTER_COLOR = "#1f77b4"
 OUT_DIR_BASE = Path("result_summary/landscape")
-
 
 # ---------- IO ----------
 def read_sampling_csv(path: Path) -> pd.DataFrame:
@@ -63,7 +64,6 @@ def read_sampling_csv(path: Path) -> pd.DataFrame:
         raise ValueError("Sampling CSV must contain a 'bitstring' column.")
     df["bitstring"] = df["bitstring"].astype(str)
     return df[["bitstring"]].copy()
-
 
 def read_prediction_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
@@ -78,46 +78,114 @@ def read_prediction_csv(path: Path) -> pd.DataFrame:
         df = df.sort_values("rank", ascending=True).reset_index(drop=True)
     return df[["bitstring", "rank"]].copy()
 
-
-# ---------- Bit matrix ----------
+# ---------- Bit utilities ----------
 def build_bit_matrix(bitstrings):
-    """
-    Build an (N, L) float32 0/1 matrix from bitstrings without huge memory overhead.
-    Suitable for very large N when L (qubits) is moderate (e.g., <= 128/256).
-    """
+    """Return dense (N, L) float32 matrix with 0/1 values."""
     L = max(len(s) for s in bitstrings)
     padded = [s.zfill(L) for s in bitstrings]
-    # Using frombuffer is very memory efficient for dense 0/1
     X = np.frombuffer("".join(padded).encode("ascii"), dtype=np.uint8).reshape(-1, L) - ord("0")
     return X.astype(np.float32)  # (N, L)
 
-
-# ---------- Embedding (memory-safe) ----------
-def embed_union(bitstrings, method="svd", random_state=42):
+def hamming_dm_via_mm(A, B):
     """
-    Compute 2D embedding on (N, L) bit matrix using SVD/PCA (no NxN matrix → memory-safe).
+    Hamming distance matrix using matrix multiplications.
+    A: (NA, L) in {0,1}, B: (NB, L) in {0,1}
+    H = sum(A,1) + sum(B,1)^T - 2*A*B^T
+    Returns float32 (NA, NB).
     """
-    X = build_bit_matrix(bitstrings)
-    if method.lower() == "pca":
-        model = PCA(n_components=2, random_state=random_state)
-    else:
-        # default: TruncatedSVD (works on dense; for huge L, still faster/stabler than PCA)
-        model = TruncatedSVD(n_components=2, random_state=random_state)
-    XY = model.fit_transform(X)
-    return XY  # (N,2)
+    sum_a = A.sum(axis=1, dtype=np.float32)[:, None]       # (NA,1)
+    sum_b = B.sum(axis=1, dtype=np.float32)[None, :]       # (1,NB)
+    dot = A @ B.T                                          # (NA,NB)
+    H = sum_a + sum_b - 2.0 * dot
+    return H
 
+# ---------- Landmark-MDS embedding ----------
+def landmark_mds_embed(bitstrings, M=2000, batch_size=8000, seed=42, mds_max_iter=400, mds_n_init=2):
+    """
+    Returns:
+      XY: (N,2) embedding for ALL points (landmarks first, then non-landmarks).
+      order_idx: index array of length N describing the permutation applied
+                 (landmarks first). Useful for reordering downstream.
+      lm_idx: indices of landmarks within the original order.
+    """
+    rng = np.random.default_rng(seed)
+    N = len(bitstrings)
+    X = build_bit_matrix(bitstrings)  # (N,L)
 
+    # Choose landmarks
+    M = min(M, N)
+    lm_idx = rng.choice(N, size=M, replace=False)
+    non_lm_idx = np.setdiff1d(np.arange(N), lm_idx)
+
+    X_lm = X[lm_idx]  # (M,L)
+
+    # M×M Hamming distances among landmarks
+    D_ll = hamming_dm_via_mm(X_lm, X_lm).astype(np.float32)
+
+    # Classical MDS on landmarks (dissimilarity = Hamming)
+    mds = MDS(n_components=2, dissimilarity="precomputed",
+              random_state=seed, n_init=mds_n_init, max_iter=mds_max_iter)
+    Y_lm = mds.fit_transform(D_ll).astype(np.float32)  # (M,2)
+
+    # Precompute for out-of-sample multilateration
+    y_norm2 = (Y_lm ** 2).sum(axis=1)                  # (M,)
+    P_cache = []   # list of (2,M) arrays
+    Ginv_cache = []  # list of (2,2) arrays
+    for r in range(M):
+        P_r = (2.0 * (Y_lm - Y_lm[r])).T              # (2,M)
+        G_r = P_r @ P_r.T                              # (2,2)
+        # regularize if near-singular
+        G_r += 1e-8 * np.eye(2, dtype=np.float32)
+        Ginv_cache.append(np.linalg.inv(G_r).astype(np.float32))
+        P_cache.append(P_r.astype(np.float32))
+
+    # Allocate result
+    Y = np.zeros((N, 2), dtype=np.float32)
+    Y[lm_idx] = Y_lm
+
+    # Stream the remaining points in batches
+    if len(non_lm_idx) > 0:
+        for s in range(0, len(non_lm_idx), batch_size):
+            e = min(len(non_lm_idx), s + batch_size)
+            idx_batch = non_lm_idx[s:e]
+            Xb = X[idx_batch]                           # (B,L)
+
+            # Distances to all landmarks: (B,M)
+            d_bl = hamming_dm_via_mm(Xb, X_lm).astype(np.float32)
+            d2 = d_bl ** 2
+
+            # For each row, choose the closest landmark as reference r
+            r_idx = np.argmin(d_bl, axis=1)             # (B,)
+
+            # Prepare outputs
+            Yb = np.zeros((len(idx_batch), 2), dtype=np.float32)
+
+            for i in range(len(idx_batch)):
+                r = int(r_idx[i])
+                # b = (||y_j||^2 - ||y_r||^2) + (d_r^2 - d_j^2) for all j
+                b = (y_norm2 - y_norm2[r]) + (d2[i, r] - d2[i, :])         # (M,)
+                # v = P_r @ b ; x = Ginv_r @ v
+                v = P_cache[r] @ b                                         # (2,)
+                x = Ginv_cache[r] @ v                                      # (2,)
+                Yb[i] = x
+
+            Y[idx_batch] = Yb
+
+    # Order: landmarks first, then non-landmarks
+    order_idx = np.concatenate([lm_idx, non_lm_idx], axis=0)
+    return Y[order_idx], order_idx, lm_idx
+
+# ---------- Center & scale ----------
 def center_and_scale(XY, center_idx=None, margin=0.02):
     XYc = XY.copy()
     if center_idx is not None:
-        XYc -= XYc[center_idx]  # translate so best rank is at origin
+        XYc -= XYc[center_idx]
     m = np.abs(XYc).max()
-    s = 1.0 if m < 1e-12 else (1.0 - margin) / m
+    s = 1.0 if m < 1e-9 else (1.0 - margin) / m
     XYc *= s
     return XYc
 
-
-# ---------- Density on 2D (efficient in 2D) ----------
+# ---------- Density & contrast ----------
 def knn_density_2d(XY, k=20):
     if len(XY) == 0:
         return np.zeros(0, dtype=float)
@@ -126,14 +194,12 @@ def knn_density_2d(XY, k=20):
     dists, _ = nn.kneighbors(XY)
     mean_d = dists[:, 1:].mean(axis=1)
     dens = 1.0 / (mean_d + 1e-12)
-    # normalize to [0,1]
     dmin, dmax = dens.min(), dens.max()
     if dmax > dmin:
         dens = (dens - dmin) / (dmax - dmin)
     else:
         dens = np.zeros_like(dens)
     return dens
-
 
 def enhance_contrast(values, floor=0.28, vmax_pct=0.80, gamma=0.75):
     if len(values) == 0:
@@ -143,18 +209,18 @@ def enhance_contrast(values, floor=0.28, vmax_pct=0.80, gamma=0.75):
     if vmax <= 1e-12:
         vmax = 1.0
     v = np.clip(v / vmax, 0.0, 1.0)
-    v = np.power(v, gamma)        # gamma < 1 → lift low values
-    v = floor + (1.0 - floor) * v # non-zero floor
+    v = np.power(v, gamma)                  # lift lows
+    v = floor + (1.0 - floor) * v           # non-zero floor
     return v
 
-
 # ---------- Plots ----------
-def plot_sampling_topview(XY_union_ordered, union_order, sampling_set,
+def plot_sampling_topview(XY_union, union_bits, sampling_bits,
                           case_id, out_dir, k_density=20,
                           floor=0.28, vmax_pct=0.80, gamma=0.75,
                           gridsize=60, point_size=8, alpha_pts=0.95):
-    samp_mask = np.array([b in sampling_set for b in union_order], dtype=bool)
-    XYs = XY_union_ordered[samp_mask]
+    samp_set = set(sampling_bits)
+    mask = np.array([b in samp_set for b in union_bits], dtype=bool)
+    XYs = XY_union[mask]
     dens = knn_density_2d(XYs, k=k_density) if len(XYs) >= 3 else np.zeros(len(XYs))
     dens_vis = enhance_contrast(dens, floor=floor, vmax_pct=vmax_pct, gamma=gamma)
 
@@ -173,16 +239,14 @@ def plot_sampling_topview(XY_union_ordered, union_order, sampling_set,
     fig.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"{case_id}_sampling_topview.{ext}", dpi=300)
+        fig.savefig(out_dir / f"{case_id}_sampling_topview_landmarkMDS.{ext}", dpi=300)
     plt.close(fig)
 
-
-def plot_funnel_3d(XY_union_ordered, df_pred, case_id, out_dir,
-                   topk=20, draw_surface=False, cone_alpha=0.28, point_size=10):
-    # Predictions are first in union order (see main); use same XY for them
+def plot_funnel_3d(XY_union, union_bits, df_pred, case_id, out_dir,
+                   topk=20, cone_alpha=0.28, point_size=10):
     pred_bits = df_pred["bitstring"].tolist()
     n_pred = len(pred_bits)
-    XYp = XY_union_ordered[:n_pred, :]
+    XYp = XY_union[:n_pred, :]  # predictions are placed first (see main)
 
     ranks = df_pred["rank"].to_numpy()
     n = len(ranks)
@@ -194,7 +258,7 @@ def plot_funnel_3d(XY_union_ordered, df_pred, case_id, out_dir,
     fig = plt.figure(figsize=(9, 9))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Reference cone surface (light)
+    # reference cone
     Rg = np.linspace(0.0, 1.0, 90)
     Tg = np.linspace(0.0, 2 * np.pi, 180)
     Rm, Tm = np.meshgrid(Rg, Tg)
@@ -202,20 +266,17 @@ def plot_funnel_3d(XY_union_ordered, df_pred, case_id, out_dir,
     Ys = Rm * np.sin(Tm)
     Zs = -Rm
     ax.plot_surface(Xs, Ys, Zs, rstride=2, cstride=2,
-                    cmap=CMAP_BLUES, alpha=cone_alpha, edgecolor="none")
+        cmap=CMAP_BLUES, alpha=cone_alpha, edgecolor="none")
 
-    # Scatter predictions colored by depth
     norm = Normalize(vmin=Z.min(), vmax=Z.max())
     colors = plt.cm.get_cmap(CMAP_BLUES)(norm(Z))
     ax.scatter(XYp[:, 0], XYp[:, 1], Z, s=point_size, c=colors,
                depthshade=False, edgecolors="k", linewidths=0.2)
 
-    # Highlight rank-1 at center
     i_best = int(np.argmin(ranks))
     ax.scatter([0.0], [0.0], [Z[i_best]], s=160, c=CENTER_COLOR,
                edgecolors="k", linewidths=0.8, depthshade=False, label="Rank-1")
 
-    # Annotate top-k
     kk = min(topk, n)
     order = np.argsort(ranks)[:kk]
     for pos, i in enumerate(order, start=1):
@@ -225,31 +286,31 @@ def plot_funnel_3d(XY_union_ordered, df_pred, case_id, out_dir,
     ax.set_xlim(-1.0, 1.0); ax.set_ylim(-1.0, 1.0)
     ax.set_zlim(min(-1.2, Z.min() - 0.05), 0.15)
     ax.view_init(elev=35, azim=-60)
-    ax.set_title(f"{case_id}: Re-ranked energy funnel (shared XY)")
+    ax.set_title(f"{case_id}: Re-ranked energy funnel (shared XY, landmark-MDS)")
     ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Normalized depth")
     ax.legend(loc="upper right")
 
     fig.tight_layout()
     out_dir.mkdir(parents=True, exist_ok=True)
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"{case_id}_funnel_3d.{ext}", dpi=300)
+        fig.savefig(out_dir / f"{case_id}_funnel_3d_landmarkMDS.{ext}", dpi=300)
     plt.close(fig)
 
-    # Export mapping
     out = df_pred.copy()
     out["x"] = XYp[:, 0]; out["y"] = XYp[:, 1]; out["z_norm_rank"] = Z
-    out.to_csv(out_dir / f"{case_id}_funnel_mapping.csv", index=False)
-
+    out.to_csv(out_dir / f"{case_id}_funnel_mapping_landmarkMDS.csv", index=False)
 
 # ---------- Main ----------
 def main():
-    parser = argparse.ArgumentParser(description="Memory-safe sampling top view and rank-based 3D funnel (shared XY).")
+    parser = argparse.ArgumentParser(description="Sampling top view + rank funnel with Landmark-MDS (Hamming).")
     parser.add_argument("--case", type=str, default="6czf", help="Case ID")
     parser.add_argument("--sampling_csv", type=Path, default=None, help="Path to sampling CSV")
     parser.add_argument("--pred_csv", type=Path, default=None, help="Path to prediction CSV")
-    parser.add_argument("--embed", type=str, default="svd", choices=["svd", "pca"],
-                        help="Embedding backend for 0/1 bit matrix")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for embedding")
+    parser.add_argument("--landmarks", type=int, default=2000, help="Number of landmark points (M)")
+    parser.add_argument("--batch_size", type=int, default=8000, help="Batch size for out-of-sample embedding")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--mds_max_iter", type=int, default=400, help="MDS max iterations for landmarks")
+    parser.add_argument("--mds_n_init", type=int, default=2, help="MDS n_init for landmarks")
     # density/visual controls
     parser.add_argument("--k_density", type=int, default=20, help="k for kNN density")
     parser.add_argument("--density_floor", type=float, default=0.28, help="Color floor for low densities")
@@ -274,29 +335,35 @@ def main():
     df_pred = read_prediction_csv(pred_csv)  # rank ascending
     pred_bits = df_pred["bitstring"].tolist()
     samp_bits = df_samp["bitstring"].tolist()
-    samp_set = set(samp_bits)
 
-    # Build union list with predictions FIRST (so XY[:n_pred] matches predictions)
+    # Union with predictions FIRST (so XY[:n_pred] matches predictions)
     union_bits = pred_bits + [b for b in samp_bits if b not in set(pred_bits)]
 
-    # Embed (memory-safe)
-    XY = embed_union(union_bits, method=args.embed, random_state=args.seed)
+    # Landmark-MDS embedding on union
+    XY_raw, order_idx, lm_idx = landmark_mds_embed(
+        union_bits,
+        M=args.landmarks,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        mds_max_iter=args.mds_max_iter,
+        mds_n_init=args.mds_n_init,
+    )
 
-    # Center at rank-1, then scale
-    best_bit = df_pred.iloc[0]["bitstring"]
-    best_idx = union_bits.index(best_bit)
-    XY_cs = center_and_scale(XY, center_idx=best_idx, margin=0.02)
+    # Center at rank-1, then scale; the first element of union_bits is rank-1 bitstring
+    best_idx = 0
+    XY_cs = center_and_scale(XY_raw, center_idx=best_idx, margin=0.02)
 
-    # Save mapping (union)
-    map_df = pd.DataFrame({"bitstring": union_bits, "x": XY_cs[:, 0], "y": XY_cs[:, 1]})
+    # Save union mapping
     out_dir.mkdir(parents=True, exist_ok=True)
-    map_df.to_csv(out_dir / f"{case_id}_union_xy_mapping.csv", index=False)
+    pd.DataFrame({"bitstring": union_bits, "x": XY_cs[:, 0], "y": XY_cs[:, 1]}).to_csv(
+        out_dir / f"{case_id}_union_xy_mapping_landmarkMDS.csv", index=False
+    )
 
     # Plots
     plot_sampling_topview(
-        XY_union_ordered=XY_cs,
-        union_order=union_bits,
-        sampling_set=samp_set,
+        XY_union=XY_cs,
+        union_bits=union_bits,
+        sampling_bits=samp_bits,
         case_id=case_id,
         out_dir=out_dir,
         k_density=args.k_density,
@@ -309,18 +376,17 @@ def main():
     )
 
     plot_funnel_3d(
-        XY_union_ordered=XY_cs,
+        XY_union=XY_cs,
+        union_bits=union_bits,
         df_pred=df_pred,
         case_id=case_id,
         out_dir=out_dir,
         topk=args.topk,
-        draw_surface=False,        # keep False for very large N (triangulation would be heavy)
         cone_alpha=0.28,
         point_size=10,
     )
 
     print("[Done]", out_dir.resolve())
-
 
 if __name__ == "__main__":
     main()
