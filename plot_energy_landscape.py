@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # @file: plot_landscape_light_en.py
 # @desc: Lightweight O(n) landscape visualization where z increases with distance from the global minimum.
+#        Uses your requested parameters: Z_POWER=0.35, DIST_GAIN=0.55, DIST_POWER=0.95
 #        Reads e_results/1m7y/energies.jsonl
 #        Outputs: result_summary/landscape/{funnel_3d,density_2d}.png/pdf
 
@@ -105,67 +106,71 @@ def main():
         tau = float(np.percentile(dE, 75) - np.percentile(dE, 25) + 1e-12)
     Ehat = dE / (median_absolute_deviation(dE) + 1e-12)
 
-    # Single-source structural distance to the global minimum
+    # Distance to the global minimum, scaled by 95th percentile (keeps small but non-zero)
     bs_min = bitstrings[idx_min]
     use_rmsd = positions[idx_min] is not None and all(p is not None for p in positions)
     if use_rmsd:
         Ps = equalize_lengths([p for p in positions if p is not None])
         Pmin = Ps[idx_min]
         dist_to_min_raw = np.array([rmsd_after_kabsch(Pmin, Ps[i]) for i in range(n)], dtype=float)
-        # robust to [0,1]
-        d_med = np.median(dist_to_min_raw)
-        d_mad = median_absolute_deviation(dist_to_min_raw)
-        d_scale = (dist_to_min_raw - d_med) / (d_mad + 1e-12)
-        d_scale = np.clip(d_scale, 0.0, None)
-        dist_w = d_scale / (np.percentile(d_scale, 95) + 1e-12)
+        p95 = np.percentile(dist_to_min_raw, 95)
+        dist_w = dist_to_min_raw / (p95 + 1e-12)
     else:
-        dist_w = np.array([hamming_to_min(bitstrings[i], bs_min) for i in range(n)], dtype=float)
+        raw = np.array([hamming_to_min(bitstrings[i], bs_min) for i in range(n)], dtype=float)
+        p95 = np.percentile(raw, 95)
+        dist_w = raw / (p95 + 1e-12)
 
-    dist_w[idx_min] = 0.0  # exact zero at the minimum
     dist_w = np.clip(dist_w, 0.0, 1.0)
+    dist_w[idx_min] = 0.0
 
-    # Radius (keep lightweight radial design; not required for your z requirement)
-    # Energy-dominant radius with a small structural correction
+    # Radius: less compression near the bottom, more structural weight
     rank_norm = (np.argsort(np.argsort(E)) / (n - 1)).astype(float)
-    a, b, p = 0.75, 0.25, 0.6
+    a, b, p = 0.55, 0.45, 1.1
     r = a * (rank_norm ** p) + b * dist_w
     r[idx_min] = 0.0
+
+    # Small radius floor for non-minimum points to avoid collapsing
+    idx = np.arange(n)
+    mask = idx != idx_min
+    r_floor = 0.03 + 0.07 * rank_norm
+    r[mask] = np.maximum(r[mask], r_floor[mask])
+
+    # Optional: gently separate near-equal energies into thin rings
+    E_bucket = np.round(E - Emin, 4)
+    _, bucket_idx = np.unique(E_bucket, return_inverse=True)
+    r += 0.012 * bucket_idx.astype(float)
 
     # Angle from hash to spread points deterministically
     theta = np.array([stable_angle_from_hash(bs) for bs in bitstrings], dtype=float)
     x2d = r * np.cos(theta)
     y2d = r * np.sin(theta)
 
-    # ---------- z mapping: energy + distance-to-min ----------
-    # Energy term: sharper near the bottom
-    Z_POWER = 1.25
+    # ----------- z mapping: your requested parameters -----------
+    Z_POWER = 0.5
     z_energy = np.power(np.maximum(Ehat - Ehat.min(), 0.0) + 1e-12, Z_POWER)
 
-    # Distance lift: strictly increasing with distance from the minimum
-    # Use a smooth, convex ramp; smoothstep-like: s = d^q (q>=1). Larger q => stronger far-field lift.
-    DIST_GAIN = 0.9    # strength of distance-induced uplift
-    DIST_POWER = 1.4   # >1 emphasizes farther points; try 1.2–1.8
+    DIST_GAIN = 0.45
+    DIST_POWER = 0.98
     z_dist = DIST_GAIN * np.power(dist_w, DIST_POWER)
 
-    # Small ruggedness to avoid a perfectly smooth wall
     rough = np.array([((int.from_bytes(hashlib.md5(bs.encode()).digest()[8:12], 'big') / 2**32) - 0.5)
                       for bs in bitstrings], dtype=float)
-    z3d = z_energy + z_dist + 0.05 * rough
+    z3d = z_energy + z_dist + 0.02 * rough
 
-    # Sink the K lowest-energy structures (sharp tip)
-    SINK_K = max(3, int(0.002 * n))   # ~0.2% of the dataset
-    SINK_DELTA = 0.35
+    # Sink a small set of lowest-energy structures to sharpen the tip
+    SINK_K = max(3, int(0.002 * n))
+    SINK_DELTA = 0.1
     order = np.argsort(E)
     lowest_k = order[:SINK_K]
     if len(lowest_k) > 0:
-        grades = np.linspace(1.0, 0.6, len(lowest_k))
+        grades = np.linspace(1.0, 0.7, len(lowest_k))
         z3d[lowest_k] -= SINK_DELTA * grades
 
     # Ensure the global minimum is strictly the lowest
     z3d[idx_min] = np.min(z3d) - 1e-6
 
     # ---------- 3D plot ----------
-    fig = plt.figure(figsize=(8, 7), dpi=150)
+    fig = plt.figure(figsize=(8, 8), dpi=600)
     ax = fig.add_subplot(111, projection='3d')
     sc = ax.scatter(x2d, y2d, z3d, s=6, c=E, cmap="viridis", alpha=0.9, depthshade=True)
     ax.scatter([x2d[idx_min]], [y2d[idx_min]], [z3d[idx_min]], s=60, c="red",
@@ -179,11 +184,11 @@ def main():
     ax.view_init(elev=28, azim=38)
     ensure_dir(OUTDIR)
     for ext in ["png", "pdf"]:
-        fig.savefig(OUTDIR / f"funnel_3d.{ext}", bbox_inches="tight")
+        fig.savefig(outdir := OUTDIR / f"funnel_3d.{ext}", bbox_inches="tight")
     plt.close(fig)
 
     # ---------- 2D plot ----------
-    fig = plt.figure(figsize=(7.5, 7), dpi=150)
+    fig = plt.figure(figsize=(7.5, 7), dpi=600)
     ax = fig.add_subplot(111)
     hb = ax.hexbin(x2d, y2d, gridsize=60, mincnt=1, cmap="Blues", linewidths=0.0)
     cb = fig.colorbar(hb, ax=ax, shrink=0.8, pad=0.02)

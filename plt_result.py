@@ -22,7 +22,7 @@ plt.rcParams.update({
     "legend.fontsize": 15,
     "xtick.labelsize": 13,
     "ytick.labelsize": 13,
-    "figure.dpi": 150,
+    "figure.dpi": 600,
 })
 
 METHOD_COLUMNS = ["qsad_rmsd", "af3_rmsd", "colabfold_rmsd", "vqe_rmsd"]
@@ -112,7 +112,7 @@ def plot_grouped_bar(df, out_dir: Path, top_n=0):
 
     out_dir.mkdir(parents=True, exist_ok=True)
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"bar_grouped_per_pdb.{ext}", dpi=300)
+        fig.savefig(out_dir / f"bar_grouped_per_pdb.{ext}", dpi=600)
     plt.close(fig)
 
 
@@ -144,7 +144,7 @@ def plot_boxplots(df, out_dir: Path):
     fig.tight_layout()
 
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"boxplot_by_method.{ext}", dpi=300)
+        fig.savefig(out_dir / f"boxplot_by_method.{ext}", dpi=600)
     plt.close(fig)
 
 
@@ -164,7 +164,7 @@ def plot_ecdf(df, out_dir: Path):
     fig.tight_layout()
 
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"ecdf_by_method.{ext}", dpi=300)
+        fig.savefig(out_dir / f"ecdf_by_method.{ext}", dpi=600)
     plt.close(fig)
 
 
@@ -190,7 +190,7 @@ def plot_scatter_vs_qsad(df, out_dir: Path):
         fig.tight_layout()
 
         for ext in ("png", "pdf"):
-            fig.savefig(out_dir / f"scatter_{METHOD_LABELS[col].lower()}_vs_qsad.{ext}", dpi=300)
+            fig.savefig(out_dir / f"scatter_{METHOD_LABELS[col].lower()}_vs_qsad.{ext}", dpi=600)
         plt.close(fig)
 
 
@@ -228,7 +228,7 @@ def plot_delta_bar(df, out_dir: Path, top_n=0):
     fig.tight_layout()
 
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"delta_bar_vs_qsad.{ext}", dpi=300)
+        fig.savefig(out_dir / f"delta_bar_vs_qsad.{ext}", dpi=600)
     plt.close(fig)
 
 
