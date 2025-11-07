@@ -4,16 +4,11 @@
 # @Email : yzhan135@kent.edu
 # @File:plt_circuit.py
 
-# --*-- coding:utf-8 --*--
-# @time: 11/07/25
-# @author: Yuqi Zhang
-# @desc: Build H from protein sequence, construct circuit using existing sampling logic,
-#        remove measurements (no sampling), transpile/decompose to backend basis,
-#        and save full circuits (raw / no-measure / transpiled) as images & QASM.
-
-import os
 from pathlib import Path
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Optional
+import subprocess
+import shutil
+import tempfile
 
 import qiskit
 from qiskit import transpile
@@ -28,12 +23,13 @@ from Protein_Folding.protein_folding_problem import ProteinFoldingProblem
 from sampling.circuits import make_sampling_circuit, build_ansatz, random_params
 
 
+# ----------- configuration -----------
 OUTPUT_DIR = Path("circuit_plots")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 PROTEINS: List[Dict[str, str]] = [
-    {"protein_name": "4mo4", "sequence": "NIGGF"},
-    # {"protein_name": "toy14", "sequence": "YLVTHLMGADLNNI"},
+    {"protein_name": "toy13", "sequence": "ELISNSSDALDKI"},
+    {"protein_name": "toy14", "sequence": "YLVTHLMGADLNNI"},
 ]
 
 REPS: int = 1
@@ -46,6 +42,13 @@ DEFAULT_BASIS = ["rz", "sx", "x", "cx", "id"]
 
 PENALTY_PARAMS: Tuple[int, int, int] = (10, 10, 10)
 DRAW_FORMATS = ("png", "pdf")
+
+# LaTeX export and compile
+EXPORT_LATEX = True
+LATEX_STANDALONE = True
+# order of compilers to try; latexmk is most reliable
+LATEX_COMPILERS = ["latexmk", "pdflatex", "xelatex"]
+# -------------------------------------
 
 
 def build_protein_hamiltonian(sequence: str, penalties: Tuple[int, int, int]) -> SparsePauliOp:
@@ -63,7 +66,6 @@ def build_protein_hamiltonian(sequence: str, penalties: Tuple[int, int, int]) ->
 
 
 def remove_final_measurements(circ: qiskit.QuantumCircuit) -> qiskit.QuantumCircuit:
-    """Safely remove all final measurements."""
     if hasattr(circ, "remove_final_measurements"):
         return circ.remove_final_measurements(inplace=False)
     new_circ = qiskit.QuantumCircuit(circ.num_qubits, circ.num_clbits)
@@ -77,7 +79,6 @@ def remove_final_measurements(circ: qiskit.QuantumCircuit) -> qiskit.QuantumCirc
 
 
 def get_backend_and_basis(backend_name: Optional[str]):
-    """Return (backend_or_None, basis_gates_list)."""
     if backend_name:
         try:
             svc = QiskitRuntimeService()
@@ -95,22 +96,103 @@ def get_backend_and_basis(backend_name: Optional[str]):
     return None, DEFAULT_BASIS
 
 
+def _textdrawing_to_str(td) -> str:
+    try:
+        return td.single_string()
+    except Exception:
+        return str(td)
+
+
+def _compile_latex_to_pdf(tex_path: Path, out_pdf_path: Path) -> bool:
+    """Compile LaTeX into a PDF next to out_pdf_path. Returns True on success."""
+    # Work in a temp dir to avoid clutter; then copy the PDF out.
+    with tempfile.TemporaryDirectory() as td:
+        tdir = Path(td)
+        local_tex = tdir / tex_path.name
+        local_tex.write_text(tex_path.read_text())
+
+        # Choose a compiler
+        compiler = None
+        for c in LATEX_COMPILERS:
+            if shutil.which(c):
+                compiler = c
+                break
+        if compiler is None:
+            return False
+
+        try:
+            if compiler == "latexmk":
+                cmd = ["latexmk", "-pdf", "-interaction=nonstopmode", "-halt-on-error", local_tex.name]
+                subprocess.run(cmd, cwd=tdir, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                produced = local_tex.with_suffix(".pdf")
+            elif compiler in ("pdflatex", "xelatex"):
+                # Run twice to stabilize references
+                cmd = [compiler, "-interaction=nonstopmode", "-halt-on-error", local_tex.name]
+                subprocess.run(cmd, cwd=tdir, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                subprocess.run(cmd, cwd=tdir, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                produced = local_tex.with_suffix(".pdf")
+            else:
+                return False
+
+            if produced.exists():
+                out_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+                out_pdf_path.write_bytes(produced.read_bytes())
+                return True
+        except subprocess.CalledProcessError:
+            return False
+    return False
+
+
 def save_circuit_draw(circ: qiskit.QuantumCircuit, out_stem: Path):
-    """Save the circuit as QASM and diagram (PNG/PDF)."""
+    """Save QASM, image (PNG/PDF), LaTeX, and compile LaTeX to PDF. ASCII fallback when needed."""
+    # QASM
     try:
         qasm_text = circ.qasm()
         (out_stem.with_suffix(".qasm")).write_text(qasm_text)
     except Exception:
         pass
 
+    # Images via matplotlib; fallback to ASCII text diagrams
     for ext in DRAW_FORMATS:
         try:
-            circ.draw(output="mpl", fold=-1, idle_wires=False, scale=1.0).figure.savefig(
-                out_stem.with_suffix(f".{ext}"),
-                bbox_inches="tight", dpi=300
-            )
+            fig = circ.draw(output="mpl", fold=-1, idle_wires=False, scale=1.0).figure
+            fig.savefig(out_stem.with_suffix(f".{ext}"), bbox_inches="tight", dpi=300)
         except Exception:
-            (out_stem.with_suffix(f".{ext}.txt")).write_text(circ.draw(output="text"))
+            td = circ.draw(output="text", fold=-1)
+            (out_stem.with_suffix(f".{ext}.txt")).write_text(_textdrawing_to_str(td))
+
+    # LaTeX export and compile
+    if EXPORT_LATEX:
+        try:
+            latex_src = circ.draw(
+                output="latex_source",
+                fold=-1,
+                idle_wires=False,
+                scale=1.0,
+                standalone=LATEX_STANDALONE,
+            )
+            if not isinstance(latex_src, str):
+                latex_src = str(latex_src)
+            tex_path = out_stem.with_suffix(".tex")
+            tex_path.write_text(latex_src)
+
+            # Compile to PDF named *_latex.pdf to avoid clobbering matplotlib PDF
+            latex_pdf_path = out_stem.with_name(out_stem.name + "_latex").with_suffix(".pdf")
+            ok = _compile_latex_to_pdf(tex_path, latex_pdf_path)
+            if not ok:
+                # Provide a readable fallback note if compilation is unavailable
+                note = (
+                    "LaTeX compilation failed or LaTeX toolchain not found. "
+                    "Install a TeX distribution (e.g., MacTeX/TeX Live) or ensure 'latexmk'/'pdflatex' is on PATH."
+                )
+                (out_stem.with_suffix(".tex.txt")).write_text(note + "\n\n" + latex_src)
+        except Exception:
+            # As a last resort, also dump ASCII diagram to .tex.txt
+            td = circ.draw(output="text", fold=-1)
+            ascii_text = _textdrawing_to_str(td)
+            (out_stem.with_suffix(".tex.txt")).write_text(
+                "LaTeX export failed; ASCII diagram instead:\n\n" + ascii_text
+            )
 
 
 def main():
@@ -152,7 +234,7 @@ def main():
         save_circuit_draw(no_meas_circ,  out_dir / f"{name}_no_measure_beta{BETA}")
         save_circuit_draw(transpiled,    out_dir / f"{name}_transpiled_beta{BETA}")
 
-        print(f"[OK] {name}: saved to {out_dir}")
+        print(f"[OK] {name}: outputs in {out_dir.resolve()}")
 
 
 if __name__ == "__main__":
