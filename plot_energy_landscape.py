@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # @file: plot_landscape_light_en.py
-# @desc: Lightweight O(n) landscape visualization.
+# @desc: Lightweight O(n) landscape visualization with sharpened funnel bottom.
 #        Reads e_results/1m7y/energies.jsonl
 #        Outputs: result_summary/landscape/{funnel_3d,density_2d}.png/pdf
 
@@ -98,6 +98,7 @@ def main():
     idx_min = int(np.argmin(E))
     Emin = float(E[idx_min])
 
+    # Energy normalization
     dE = E - Emin
     tau = median_absolute_deviation(dE)
     if tau <= 1e-12:
@@ -105,6 +106,7 @@ def main():
     Ehat = dE / (median_absolute_deviation(dE) + 1e-12)
     rank_norm = (np.argsort(np.argsort(E)) / (n - 1)).astype(float)
 
+    # Single-source structural distance to the lowest-energy sample
     bs_min = bitstrings[idx_min]
     use_rmsd = positions[idx_min] is not None and all(p is not None for p in positions)
     if use_rmsd:
@@ -122,17 +124,46 @@ def main():
 
     struct_to_min[idx_min] = 0.0
 
+    # Radius: energy-dominant with a small structural correction
     a, b, p = 0.75, 0.25, 0.6
     r = a * (rank_norm ** p) + b * struct_to_min
     r[idx_min] = 0.0
 
+    # Angle: deterministic from hash
     theta = np.array([stable_angle_from_hash(bs) for bs in bitstrings], dtype=float)
     x2d = r * np.cos(theta)
     y2d = r * np.sin(theta)
 
+    # ----------- sharpened funnel z -----------
+    # Nonlinear energy-to-height mapping (sharper near minimum)
+    Z_POWER = 1.25
+    z_base = np.power(np.maximum(Ehat - Ehat.min(), 0.0) + 1e-12, Z_POWER)
+
+    # Rugged walls: small deterministic noise
     rough = np.array([((int.from_bytes(hashlib.md5(bs.encode()).digest()[8:12], 'big') / 2**32) - 0.5)
                       for bs in bitstrings], dtype=float)
-    z3d = Ehat + 0.08 * rough
+    z3d = z_base + 0.08 * rough
+
+    # Sink the K lowest-energy structures
+    SINK_K = max(3, int(0.002 * n))  # ~0.2% of the dataset
+    SINK_DELTA = 0.35
+    order = np.argsort(E)
+    lowest_k = order[:SINK_K]
+    if len(lowest_k) > 0:
+        grades = np.linspace(1.0, 0.6, len(lowest_k))
+        z3d[lowest_k] -= SINK_DELTA * grades
+
+    # Lift other samples that tie (by rounded energy) with the K-th minimum
+    ROUND_DEC = 4
+    UPLIFT_SAME = 0.15
+    if SINK_K > 0:
+        Ek = np.round(E[order[SINK_K - 1]], decimals=ROUND_DEC)
+        tied = np.where(np.round(E, ROUND_DEC) == Ek)[0]
+        tied = np.setdiff1d(tied, lowest_k, assume_unique=False)
+        if tied.size > 0:
+            z3d[tied] += UPLIFT_SAME
+
+    # Ensure the global minimum is strictly the lowest
     z3d[idx_min] = np.min(z3d) - 1e-6
 
     # ----------- 3D Funnel -----------
@@ -172,6 +203,7 @@ def main():
         fig.savefig(OUTDIR / f"density_2d.{ext}", bbox_inches="tight")
     plt.close(fig)
 
+    # Save coordinates for downstream use
     np.savez(OUTDIR / "coords_outputs_light.npz",
              X2d=x2d, Y2d=y2d, Z3d=z3d, E=E, idx_min=idx_min)
 
