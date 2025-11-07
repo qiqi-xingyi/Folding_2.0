@@ -28,8 +28,8 @@ OUTPUT_DIR = Path("circuit_plots")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 PROTEINS: List[Dict[str, str]] = [
-    {"protein_name": "toy13", "sequence": "ELISNSSDALDKI"},
-    {"protein_name": "toy14", "sequence": "YLVTHLMGADLNNI"},
+    {"protein_name": "4mo4", "sequence": "NIGGF"},
+
 ]
 
 REPS: int = 1
