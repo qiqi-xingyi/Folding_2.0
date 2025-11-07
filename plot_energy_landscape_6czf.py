@@ -1,37 +1,33 @@
-# --*-- conding:utf-8 --*--
-# @time:11/6/25 20:42
-# @Author : Yuqi Zhang
-# @Email : yzhan135@kent.edu
-# @File:plot_energy_landscape_6czf.py
-
+# -*- coding: utf-8 -*-
+# @time: 2025/11/06
+# @file: plot_sampling_and_funnel.py
+#
 # Description:
-#   Visualize the energy landscape for a case (default: 6czf).
-#   - Read quantum sampling CSV and prediction CSV
-#   - Unify bitstring length, build 2D embedding (PCA or MDS-Hamming)
-#   - Define energy E by priority: -log(p_rel2+eps) -> -logit2 -> normalized rank
-#   - Produce figures:
-#       (A) Sampling scatter (2D)
-#       (B) Energy scatter (2D)
-#       (C) Energy contour (2D)
-#       (D) 3D energy funnel surface
-#       (E) Energy vs. rank
-#       (F) Sampling coverage vs. TopK
-#   - Export embedding coordinates to CSV
+#   1) Plot a square 2D point cloud of quantum sampling results with blue-scale density
+#      (higher local density -> darker blue).
+#   2) Plot a rank-driven 3D funnel: rank-1 sits at the center with the deepest depth
+#      (lowest energy), others normalized by rank order. Equal prediction signatures
+#      (identical metrics) get identical normalized depth.
+#
+# Usage:
+#   python plot_sampling_and_funnel.py
+#   python plot_sampling_and_funnel.py --case 6czf \
+#     --sampling_csv quantum_data/6czf/samples_6czf_all_ibm.csv \
+#     --pred_csv predictions/6czf_pred.csv \
+#     --k_density 20 --embed pca --topk 20
 #
 # Requirements:
 #   pip install numpy pandas matplotlib scikit-learn
 
 import argparse
 from pathlib import Path
-import warnings
 import numpy as np
 import pandas as pd
-import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib import tri as mtri
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 from sklearn.decomposition import PCA
-from sklearn.manifold import MDS
+from sklearn.neighbors import NearestNeighbors
+from matplotlib.colors import Normalize
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # ---------------- Global style ----------------
 plt.rcParams.update({
@@ -45,61 +41,12 @@ plt.rcParams.update({
     "figure.dpi": 150,
 })
 
-QSAD_COLOR = "#00A59B"
-SAMPLE_COLOR = "#C7C7C7"
-TOPK_EDGE = "black"
-CMAP = "viridis"
+BLUES_CMAP = "Blues"
+CENTER_COLOR = "#1f77b4"  # a blue tone to highlight the very center point
+OUT_DIR_BASE = Path("result_summary/landscape")
 
 
-# ---------------- I/O helpers ----------------
-def read_sampling_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df.columns = [c.strip() for c in df.columns]
-    # Choose weight: prefer 'prob', else count/shots, else fallback
-    if "prob" in df.columns and df["prob"].notna().any():
-        df["weight"] = pd.to_numeric(df["prob"], errors="coerce")
-    elif {"count", "shots"}.issubset(set(df.columns)):
-        c = pd.to_numeric(df["count"], errors="coerce")
-        s = pd.to_numeric(df["shots"], errors="coerce").replace(0, np.nan)
-        df["weight"] = c / s
-    else:
-        df["weight"] = 1.0 / max(len(df), 1)
-    df["bitstring"] = df["bitstring"].astype(str)
-    return df[["bitstring", "weight"]].copy()
-
-
-def read_prediction_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df.columns = [c.strip() for c in df.columns]
-    df["bitstring"] = df["bitstring"].astype(str)
-
-    eps = 1e-12
-    E = None
-    if "p_rel2" in df.columns:
-        with np.errstate(divide="ignore"):
-            E = -np.log(pd.to_numeric(df["p_rel2"], errors="coerce") + eps)
-    if (E is None) or (E.isna().all()):
-        if "logit2" in df.columns:
-            E = -pd.to_numeric(df["logit2"], errors="coerce")
-    if (E is None) or (E.isna().all()):
-        if "rank" in df.columns:
-            rr = pd.to_numeric(df["rank"], errors="coerce")
-            E = rr / rr.max()
-        else:
-            raise ValueError("No usable columns to define energy (need p_rel2 or logit2 or rank).")
-    df["energy"] = E
-
-    if "rank" not in df.columns or df["rank"].isna().all():
-        df["rank"] = df["energy"].rank(method="first", ascending=True).astype(int)
-
-    keep_cols = ["bitstring", "energy", "rank"]
-    for c in ["sequence", "group_id", "p_rel2", "logit2", "score"]:
-        if c in df.columns:
-            keep_cols.append(c)
-    return df[keep_cols].copy()
-
-
-# ---------------- Bitstring utilities ----------------
+# ---------------- Utilities ----------------
 def pad_bitstrings(bitstrings):
     lengths = [len(s) for s in bitstrings]
     max_len = max(lengths)
@@ -110,296 +57,226 @@ def bitstrings_to_matrix(bitstrings, max_len=None):
     if max_len is None:
         _, max_len = pad_bitstrings(bitstrings)
     padded = [s.zfill(max_len) for s in bitstrings]
-    # Convert to 0/1 matrix (N, L)
     arr = np.frombuffer("".join(padded).encode("ascii"), dtype=np.uint8)
     arr = arr.reshape(-1, max_len)
     arr = arr - ord("0")
     return arr.astype(np.float32)
 
 
-def hamming_distance_matrix(arr):
-    N = arr.shape[0]
-    D = np.zeros((N, N), dtype=np.float32)
-    # Chunked computation to reduce memory pressure
-    chunk = max(1, 2000 // max(1, arr.shape[1] // 64 + 1))
-    for i in range(0, N, chunk):
-        end = min(N, i + chunk)
-        block = arr[i:end]  # (b,L)
-        diff = np.abs(block[:, None, :] - arr[None, :, :])  # (b,N,L)
-        D[i:end] = diff.sum(axis=2)
-    return D
-
-
-def embed_2d(bitstrings, method="pca", random_state=42):
+def pca_embed(bitstrings, random_state=42):
     padded, max_len = pad_bitstrings(bitstrings)
     X = bitstrings_to_matrix(padded, max_len=max_len)
-    N = X.shape[0]
-
-    if method.lower() == "mds":
-        if N > 5000:
-            warnings.warn("N too large for MDS; falling back to PCA.", RuntimeWarning)
-            method = "pca"
-        else:
-            try:
-                D = hamming_distance_matrix(X)
-                mds = MDS(
-                    n_components=2,
-                    dissimilarity="precomputed",
-                    random_state=random_state,
-                    n_init=4,
-                    max_iter=300,
-                )
-                XY = mds.fit_transform(D)
-                return XY
-            except Exception as e:
-                warnings.warn(f"MDS failed ({e}); falling back to PCA.", RuntimeWarning)
-                method = "pca"
-
     pca = PCA(n_components=2, random_state=random_state)
     XY = pca.fit_transform(X)
+    # normalize to roughly unit scale for a stable square canvas
+    XY = XY / (np.abs(XY).max() + 1e-9)
     return XY
 
 
-# ---------------- Plotting helpers ----------------
-def ensure_outdir(case_id: str) -> Path:
-    out_dir = Path("result_summary") / "landscape" / case_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
-
-
-def safe_maxfinite(a: np.ndarray, default: float = 0.0) -> float:
-    if a.size == 0:
-        return default
-    finite = a[np.isfinite(a)]
-    if finite.size == 0:
-        return default
-    return float(finite.max())
-
-
-# (A) sampling 2D
-def plot_sampling_2d(xy_all, df_all, out_dir: Path, case_id: str):
-    fig, ax = plt.subplots(figsize=(9, 7))
-    samp_idx = (df_all["source"] == "sample").to_numpy()
-    if not np.any(samp_idx):
-        ax.set_title(f"{case_id}: Quantum Sampling (no sampling points)")
-        ax.set_xlabel("Embed-X")
-        ax.set_ylabel("Embed-Y")
-        fig.tight_layout()
-        for ext in ("png", "pdf"):
-            fig.savefig(out_dir / f"{case_id}_sampling_2d.{ext}", dpi=300)
-        plt.close(fig)
-        return
-
-    s_w = df_all.loc[samp_idx, "weight"].to_numpy(dtype=float)
-    maxw = safe_maxfinite(s_w, default=0.0)
-    if maxw > 0:
-        s = 20.0 + 180.0 * (np.nan_to_num(s_w, nan=0.0) / maxw)
+def local_density_knn(xy, k=20):
+    # Higher density -> smaller mean distance -> convert to density score
+    k = max(2, min(k, len(xy)))
+    nn = NearestNeighbors(n_neighbors=k, algorithm="auto").fit(xy)
+    distances, _ = nn.kneighbors(xy)  # (N, k)
+    # Exclude the zero distance to itself by taking distances[:, 1:]
+    d = distances[:, 1:].mean(axis=1)
+    density = 1.0 / (d + 1e-12)
+    # Normalize to [0,1]
+    dmin, dmax = density.min(), density.max()
+    if dmax > dmin:
+        density = (density - dmin) / (dmax - dmin)
     else:
-        s = np.full(s_w.shape, 30.0)
-
-    ax.scatter(
-        xy_all[samp_idx, 0], xy_all[samp_idx, 1],
-        s=s, c=SAMPLE_COLOR, alpha=0.6, edgecolors="none", label="Sampling"
-    )
-    ax.set_title(f"{case_id}: Quantum Sampling (2D)")
-    ax.set_xlabel("Embed-X")
-    ax.set_ylabel("Embed-Y")
-    ax.legend()
-    fig.tight_layout()
-    for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"{case_id}_sampling_2d.{ext}", dpi=300)
-    plt.close(fig)
+        density = np.zeros_like(density)
+    return density
 
 
-# (B) energy scatter 2D
-def plot_energy_scatter_2d(xy_all, df_all, out_dir: Path, case_id: str, top_k=10):
-    fig, ax = plt.subplots(figsize=(9, 7))
-    pred_idx = (df_all["source"] == "pred").to_numpy()
-    if not np.any(pred_idx):
-        ax.set_title(f"{case_id}: Prediction Energy (no prediction points)")
-        ax.set_xlabel("Embed-X")
-        ax.set_ylabel("Embed-Y")
-        fig.tight_layout()
-        for ext in ("png", "pdf"):
-            fig.savefig(out_dir / f"{case_id}_energy_scatter_2d.{ext}", dpi=300)
-        plt.close(fig)
-        return
+def read_sampling_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.columns = [c.strip() for c in df.columns]
+    if "bitstring" not in df.columns:
+        raise ValueError("Sampling CSV must contain a 'bitstring' column.")
+    df["bitstring"] = df["bitstring"].astype(str)
+    return df[["bitstring"]].copy()
 
-    E = df_all.loc[pred_idx, "energy"].to_numpy(dtype=float)
-    if not np.isfinite(E).any():
-        E = np.zeros_like(E)
 
-    size = 30.0 + 120.0 * (1.0 / (np.nan_to_num(E, nan=0.0) + 1.0))
-    sc = ax.scatter(
-        xy_all[pred_idx, 0], xy_all[pred_idx, 1],
-        c=E, s=size, cmap=CMAP, alpha=0.85, edgecolors="black", linewidths=0.2
-    )
+def read_prediction_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.columns = [c.strip() for c in df.columns]
+    if "bitstring" not in df.columns:
+        raise ValueError("Prediction CSV must contain a 'bitstring' column.")
+    df["bitstring"] = df["bitstring"].astype(str)
+    # Ensure rank; if not present, build a ranking by p_rel2 desc, then logit2 desc, then score desc
+    if "rank" not in df.columns:
+        score_cols = [c for c in ["p_rel2", "logit2", "score"] if c in df.columns]
+        ascending = [False if c in ["p_rel2", "logit2", "score"] else True for c in score_cols]
+        if score_cols:
+            df = df.sort_values(score_cols, ascending=ascending, na_position="last")
+            df["rank"] = np.arange(1, len(df) + 1)
+        else:
+            # fallback: arbitrary ranking
+            df["rank"] = np.arange(1, len(df) + 1)
+    return df
+
+
+def equal_signature_groups(df_pred: pd.DataFrame):
+    # Build a signature from available prediction metrics
+    sig_cols = [c for c in df_pred.columns if c.startswith("p_rel") or c.startswith("logit") or c == "score"]
+    if not sig_cols:
+        # fallback: use rank equality (unlikely ties)
+        sig = df_pred["rank"].astype(str)
+    else:
+        sig = df_pred[sig_cols].astype(str).agg("|".join, axis=1)
+    return sig
+
+
+def normalize_depth_by_rank(df_pred: pd.DataFrame) -> pd.DataFrame:
+    # Sort by rank ascending; map rank to radius/depth
+    df = df_pred.copy()
+    df = df.sort_values("rank", ascending=True).reset_index(drop=True)
+
+    # If signatures are equal, assign identical normalized depth
+    sig = equal_signature_groups(df)
+    # Depth index: group by signature, assign the minimum order index for the group
+    order_index = df.index.to_series()
+    group_min_index = sig.groupby(sig).transform("min").index
+    # Map each signature to the first occurrence index (stable order)
+    first_idx_per_sig = sig.drop_duplicates().index
+    sig_to_first = {sig[i]: int(i) for i in first_idx_per_sig}
+    sig_first_idx = sig.map(sig_to_first)
+
+    n = len(df)
+    if n > 1:
+        norm = sig_first_idx.astype(float) / (n - 1)
+    else:
+        norm = pd.Series([0.0], index=df.index)
+
+    # Depth: rank-1 -> deepest (most negative), others closer to 0
+    df["norm_depth"] = -norm.values
+    return df
+
+
+def golden_angle_layout(n):
+    # Vogel spiral layout (radius grows with index, angle by golden angle)
+    # Rank-1 sits at center with r=0
+    if n <= 0:
+        return np.zeros((0, 2))
+    phi = (3 - np.sqrt(5)) * np.pi  # golden angle (~137.5 deg) in radians
+    idx = np.arange(n)  # 0..n-1
+    r = idx / max(1, n - 1)  # 0..1
+    theta = idx * phi
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+    return np.column_stack([x, y]), r
+
+
+# ---------------- Plots ----------------
+def plot_sampling_density_2d(df_sample: pd.DataFrame, case_id: str, out_dir: Path, k_density=20, embed_seed=42):
+    bits = df_sample["bitstring"].tolist()
+    XY = pca_embed(bits, random_state=embed_seed)
+    dens = local_density_knn(XY, k=k_density)
+
+    # Square figure, equal aspect
+    fig, ax = plt.subplots(figsize=(8, 8))
+    sc = ax.scatter(XY[:, 0], XY[:, 1],
+                    c=dens, cmap=BLUES_CMAP, s=16, alpha=0.95,
+                    edgecolors="none")
     cb = plt.colorbar(sc, ax=ax)
-    cb.set_label("Energy E")
+    cb.set_label("Local density")
 
-    df_pred = df_all.loc[pred_idx, ["bitstring", "energy"]].copy()
-    df_pred = df_pred[np.isfinite(df_pred["energy"])]
-    df_pred = df_pred.sort_values("energy", ascending=True).head(top_k)
-    for _, row in df_pred.iterrows():
-        mask = (df_all["bitstring"] == row["bitstring"]).to_numpy()
-        xi = xy_all[mask, 0][0]
-        yi = xy_all[mask, 1][0]
-        ax.scatter([xi], [yi], s=160, facecolors="none", edgecolors=TOPK_EDGE, linewidths=1.2)
-        ax.text(xi, yi, "Top", fontsize=12, color="black", ha="center", va="bottom")
-
-    ax.set_title(f"{case_id}: Prediction Energy (2D)")
+    ax.set_title(f"{case_id}: Sampling 2D density (PCA)")
     ax.set_xlabel("Embed-X")
     ax.set_ylabel("Embed-Y")
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(XY[:, 0].min() - 0.05, XY[:, 0].max() + 0.05)
+    ax.set_ylim(XY[:, 1].min() - 0.05, XY[:, 1].max() + 0.05)
     fig.tight_layout()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"{case_id}_energy_scatter_2d.{ext}", dpi=300)
+        fig.savefig(out_dir / f"{case_id}_sampling_density_2d.{ext}", dpi=300)
     plt.close(fig)
 
-
-# (C) energy contour 2D
-def plot_energy_contour_2d(xy_all, df_all, out_dir: Path, case_id: str, top_k=10):
-    pred_idx = (df_all["source"] == "pred").to_numpy()
-    if not np.any(pred_idx):
-        return
-    X = xy_all[pred_idx, 0]
-    Y = xy_all[pred_idx, 1]
-    Z = df_all.loc[pred_idx, "energy"].to_numpy(dtype=float)
-    if len(X) < 3 or not np.isfinite(Z).any():
-        return
-
-    triang = mtri.Triangulation(X, Y)
-    fig, ax = plt.subplots(figsize=(9, 7))
-    cntr = ax.tricontourf(triang, Z, levels=14, cmap=CMAP, alpha=0.9)
-    plt.colorbar(cntr, ax=ax, label="Energy E")
-    ax.tricontour(triang, Z, levels=14, colors="k", linewidths=0.3, alpha=0.5)
-
-    df_pred = df_all.loc[pred_idx, ["bitstring", "energy"]].copy()
-    df_pred = df_pred[np.isfinite(df_pred["energy"])]
-    df_pred = df_pred.sort_values("energy", ascending=True).head(top_k)
-    for _, row in df_pred.iterrows():
-        mask = (df_all["bitstring"] == row["bitstring"]).to_numpy()
-        xi = xy_all[mask, 0][0]
-        yi = xy_all[mask, 1][0]
-        ax.scatter([xi], [yi], s=120, c="white", edgecolors="black", linewidths=1.0, zorder=3)
-
-    ax.set_title(f"{case_id}: Energy Contour (2D)")
-    ax.set_xlabel("Embed-X")
-    ax.set_ylabel("Embed-Y")
-    fig.tight_layout()
-    for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"{case_id}_energy_contour_2d.{ext}", dpi=300)
-    plt.close(fig)
+    # Export embedding for reproducibility
+    emb = pd.DataFrame({"bitstring": bits, "x": XY[:, 0], "y": XY[:, 1], "density": dens})
+    emb.to_csv(out_dir / f"{case_id}_sampling_embedding_density.csv", index=False)
 
 
-# (D) energy funnel 3D
-def plot_energy_funnel_3d(xy_all, df_all, out_dir: Path, case_id: str, top_k=10):
-    pred_idx = (df_all["source"] == "pred").to_numpy()
-    if not np.any(pred_idx):
-        return
-    X = xy_all[pred_idx, 0]
-    Y = xy_all[pred_idx, 1]
-    Z = df_all.loc[pred_idx, "energy"].to_numpy(dtype=float)
-    if X.size < 3 or Y.size < 3 or not np.isfinite(Z).any():
-        return
+def plot_rank_funnel_3d(df_pred: pd.DataFrame, case_id: str, out_dir: Path, topk_label=20):
+    # Normalize depths by rank and signature equality
+    df_norm = normalize_depth_by_rank(df_pred)
+    n = len(df_norm)
 
-    triang = mtri.Triangulation(X, Y)
-    fig = plt.figure(figsize=(10, 8))
+    # Layout in 2D using Vogel spiral (rank-1 at center)
+    XY, radius = golden_angle_layout(n)
+    Z = df_norm["norm_depth"].to_numpy()  # in [-1, 0], rank-1 -> -0
+
+    # Build a smooth funnel surface (cone-like): Z_surf = -R
+    Rg = np.linspace(0.0, 1.0, 64)
+    Tg = np.linspace(0.0, 2 * np.pi, 128)
+    Rm, Tm = np.meshgrid(Rg, Tg)
+    Xs = Rm * np.cos(Tm)
+    Ys = Rm * np.sin(Tm)
+    Zs = -Rm  # deepest at center
+
+    # Scatter colors by normalized depth (map to Blues)
+    norm = Normalize(vmin=Z.min(), vmax=Z.max())
+    colors = plt.cm.get_cmap(BLUES_CMAP)(norm(Z))
+
+    fig = plt.figure(figsize=(9, 9))
     ax = fig.add_subplot(111, projection="3d")
 
-    trisurf = ax.plot_trisurf(triang, Z, cmap=CMAP, linewidth=0.2, antialiased=True, alpha=0.85)
-    cb = fig.colorbar(trisurf, ax=ax, shrink=0.6, aspect=12, pad=0.1)
-    cb.set_label("Energy E")
+    # Surface
+    ax.plot_surface(Xs, Ys, Zs, rstride=2, cstride=2,
+                    cmap=BLUES_CMAP, alpha=0.35, edgecolor="none")
 
-    samp_idx = (df_all["source"] == "sample").to_numpy()
-    if np.any(samp_idx):
-        xs = xy_all[samp_idx, 0]
-        ys = xy_all[samp_idx, 1]
-        z_ref = safe_maxfinite(Z, default=0.0) + 0.2
-        ax.scatter(xs, ys, z_ref, s=8, c=SAMPLE_COLOR, alpha=0.35, depthshade=False, edgecolors="none", label="Sampling")
+    # Points
+    ax.scatter(XY[:, 0], XY[:, 1], Z, s=18, c=colors, depthshade=False, edgecolors="k", linewidths=0.2)
 
-    ax.scatter(X, Y, Z, s=15, c="k", alpha=0.3, depthshade=False)
+    # Highlight top-1 at the very center
+    ax.scatter([0.0], [0.0], [Z[0]], s=160, c=CENTER_COLOR, edgecolors="k", linewidths=0.8, depthshade=False, label="Rank-1")
 
-    df_pred = df_all.loc[pred_idx, ["bitstring", "energy"]].copy()
-    df_pred = df_pred[np.isfinite(df_pred["energy"])].sort_values("energy", ascending=True).head(top_k)
-    for _, row in df_pred.iterrows():
-        mask = (df_all["bitstring"] == row["bitstring"]).to_numpy()
-        xi = xy_all[mask, 0][0]
-        yi = xy_all[mask, 1][0]
-        zi = df_all.loc[mask, "energy"].iloc[0]
-        ax.scatter([xi], [yi], [zi], s=80, c="white", edgecolors="black", depthshade=False)
+    # Optionally annotate top-k points
+    topk = min(topk_label, n)
+    for i in range(topk):
+        xi, yi, zi = XY[i, 0], XY[i, 1], Z[i]
+        ax.text(xi, yi, zi, f"{i+1}", fontsize=10, ha="center", va="bottom", color="k")
 
-    if len(df_pred) > 0:
-        row0 = df_pred.iloc[0]
-        mask0 = (df_all["bitstring"] == row0["bitstring"]).to_numpy()
-        xi = xy_all[mask0, 0][0]
-        yi = xy_all[mask0, 1][0]
-        zi = df_all.loc[mask0, "energy"].iloc[0]
-        ax.scatter([xi], [yi], [zi], s=160, c=QSAD_COLOR, edgecolors="black", linewidths=0.8, depthshade=False, label="Min E")
+    # Limits for a square footprint
+    lim = 1.05
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+    ax.set_zlim(Z.min() - 0.05, 0.1)
 
     ax.view_init(elev=35, azim=-60)
-    ax.set_title(f"{case_id}: 3D Energy Funnel")
-    ax.set_xlabel("Embed-X")
-    ax.set_ylabel("Embed-Y")
-    ax.set_zlabel("Energy E")
+    ax.set_title(f"{case_id}: Rank-driven 3D funnel (rank normalized)")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Normalized depth")
     ax.legend(loc="upper right")
+
     fig.tight_layout()
+    out_dir.mkdir(parents=True, exist_ok=True)
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"{case_id}_energy_funnel_3d.{ext}", dpi=300)
+        fig.savefig(out_dir / f"{case_id}_rank_funnel_3d.{ext}", dpi=300)
     plt.close(fig)
 
-
-# (E) energy vs. rank
-def plot_energy_vs_rank(df_pred, out_dir: Path, case_id: str):
-    dfp = df_pred.dropna(subset=["energy", "rank"]).copy()
-    if len(dfp) == 0:
-        return
-    dfp = dfp.sort_values("rank")
-    fig, ax = plt.subplots(figsize=(8.5, 6.5))
-    ax.plot(dfp["rank"], dfp["energy"], marker="o", linestyle="-", linewidth=2, markersize=4)
-    ax.set_xlabel("Rank (ascending)")
-    ax.set_ylabel("Energy E")
-    ax.set_title(f"{case_id}: Energy vs. Rank")
-    ax.grid(True, linestyle="--", alpha=0.5)
-    fig.tight_layout()
-    for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"{case_id}_energy_vs_rank.{ext}", dpi=300)
-    plt.close(fig)
-
-
-# (F) sampling coverage vs. TopK
-def plot_sampling_coverage(df_sample, df_pred, out_dir: Path, case_id: str, topk_list=(10, 50, 100)):
-    s_set = set(df_sample["bitstring"].tolist())
-    dfp = df_pred.dropna(subset=["energy"]).copy().sort_values("energy", ascending=True)
-    cov = []
-    for K in topk_list:
-        sub = dfp.head(K)
-        inter = sum(1 for b in sub["bitstring"] if b in s_set)
-        cov.append(inter / max(K, 1))
-
-    fig, ax = plt.subplots(figsize=(7.5, 6))
-    x = np.arange(len(topk_list))
-    ax.bar(x, cov, width=0.6, color="#8499BB", edgecolor="black")
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"Top-{k}" for k in topk_list])
-    ax.set_ylim(0, 1.05)
-    ax.set_ylabel("Coverage (in sampling)")
-    ax.set_title(f"{case_id}: Sampling Coverage of Low-E Predictions")
-    for i, v in enumerate(cov):
-        ax.text(i, v + 0.02, f"{v:.2f}", ha="center", va="bottom", fontsize=12)
-    fig.tight_layout()
-    for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"{case_id}_sampling_coverage.{ext}", dpi=300)
-    plt.close(fig)
+    # Export layout for traceability
+    out = df_norm.copy()
+    out["x"] = XY[:, 0]
+    out["y"] = XY[:, 1]
+    out["norm_depth"] = Z
+    out.to_csv(out_dir / f"{case_id}_rank_funnel_layout.csv", index=False)
 
 
 # ---------------- Main ----------------
 def main():
-    parser = argparse.ArgumentParser(description="Plot energy landscape (2D/3D) for a given case (default: 6czf).")
-    parser.add_argument("--case", type=str, default="6czf", help="Case ID (e.g., 6czf)")
+    parser = argparse.ArgumentParser(description="Plot sampling 2D density and rank-driven 3D funnel.")
+    parser.add_argument("--case", type=str, default="6czf", help="Case ID")
     parser.add_argument("--sampling_csv", type=Path, default=None, help="Path to sampling CSV")
     parser.add_argument("--pred_csv", type=Path, default=None, help="Path to prediction CSV")
-    parser.add_argument("--embed", type=str, default="pca", choices=["pca", "mds"], help="Embedding method")
-    parser.add_argument("--topk", type=int, default=10, help="Top-K minima to highlight")
+    parser.add_argument("--k_density", type=int, default=20, help="k for KNN local density")
+    parser.add_argument("--embed", type=str, default="pca", choices=["pca"], help="Embedding method for sampling (fixed to PCA here)")
+    parser.add_argument("--topk", type=int, default=20, help="Top-K labels to annotate in 3D")
     args = parser.parse_args()
 
     case_id = args.case
@@ -411,49 +288,18 @@ def main():
     if not pred_csv.exists():
         raise FileNotFoundError(f"Prediction CSV not found: {pred_csv}")
 
-    out_dir = ensure_outdir(case_id)
+    out_dir = OUT_DIR_BASE / case_id
 
+    # 2D density plot for sampling
     df_sample = read_sampling_csv(sampling_csv)
+    plot_sampling_density_2d(df_sample, case_id, out_dir, k_density=args.k_density, embed_seed=42)
+
+    # 3D rank-driven funnel
     df_pred = read_prediction_csv(pred_csv)
+    plot_rank_funnel_3d(df_pred, case_id, out_dir, topk_label=args.topk)
 
-    all_bits = pd.Index(df_sample["bitstring"]).union(df_pred["bitstring"]).tolist()
-    XY = embed_2d(all_bits, method=args.embed, random_state=42)
-
-    df_all = pd.DataFrame({"bitstring": all_bits})
-    df_all["source"] = "none"
-    df_all["weight"] = np.nan
-    df_all["energy"] = np.nan
-    df_all["rank"] = np.nan
-
-    s_map = df_sample.set_index("bitstring")["weight"].to_dict()
-    smask = df_all["bitstring"].isin(s_map.keys())
-    df_all.loc[smask, "source"] = "sample"
-    df_all.loc[smask, "weight"] = df_all.loc[smask, "bitstring"].map(s_map)
-
-    pE = df_pred.set_index("bitstring")["energy"].to_dict()
-    pr = df_pred.set_index("bitstring")["rank"].to_dict()
-    pmask = df_all["bitstring"].isin(pE.keys())
-    df_all.loc[pmask, "source"] = "pred"
-    df_all.loc[pmask, "energy"] = df_all.loc[pmask, "bitstring"].map(pE)
-    df_all.loc[pmask, "rank"] = df_all.loc[pmask, "bitstring"].map(pr)
-
-    emb_out = out_dir / f"{case_id}_embedding_xy.csv"
-    emb_df = df_all.copy()
-    emb_df["x"] = XY[:, 0]
-    emb_df["y"] = XY[:, 1]
-    emb_df.to_csv(emb_out, index=False)
-    print(f"[Saved] {emb_out}")
-
-    plot_sampling_2d(XY, df_all, out_dir, case_id)
-    plot_energy_scatter_2d(XY, df_all, out_dir, case_id, top_k=args.topk)
-    plot_energy_contour_2d(XY, df_all, out_dir, case_id, top_k=args.topk)
-    plot_energy_funnel_3d(XY, df_all, out_dir, case_id, top_k=args.topk)
-    plot_energy_vs_rank(df_pred, out_dir, case_id)
-    plot_sampling_coverage(df_sample, df_pred, out_dir, case_id, topk_list=(10, 50, 100))
-
-    print("[Done] All figures saved to:", out_dir.resolve())
+    print("[Done]", out_dir.resolve())
 
 
 if __name__ == "__main__":
     main()
-
