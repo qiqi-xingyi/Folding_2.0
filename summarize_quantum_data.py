@@ -1,9 +1,4 @@
-# --*-- conding:utf-8 --*--
-# @time:11/8/25 00:47
-# @Author : Yuqi Zhang
-# @Email : yzhan135@kent.edu
-# @File:summarize_quantum_data.py
-
+# -*- coding: utf-8 -*-
 # summarize_quantum_data.py
 #
 # Aggregate per-PDB quantum sampling data:
@@ -15,7 +10,6 @@ from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 from qiskit import transpile
-from qiskit_ibm_runtime import QiskitRuntimeService
 from qiskit.quantum_info import SparsePauliOp
 
 from sampling.circuits import make_sampling_circuit, build_ansatz, random_params
@@ -34,37 +28,6 @@ PENALTY_PARAMS = (10, 10, 10)
 
 ROOT = Path("quantum_data")
 SUMMARY_CSV = ROOT / "quantum_data_summary.csv"
-IBM_CONFIG_FILE = "./ibm_config.txt"
-
-
-def read_ibm_config(path: str) -> Dict[str, str]:
-    cfg: Dict[str, str] = {}
-    if not os.path.exists(path):
-        return cfg
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if "=" not in line:
-                continue
-            k, v = line.strip().split("=", 1)
-            cfg[k.strip().upper()] = v.strip()
-    return cfg
-
-
-def get_backend():
-    cfg = read_ibm_config(IBM_CONFIG_FILE)
-    try:
-        svc = QiskitRuntimeService(
-            channel="ibm_quantum_platform",
-            token=cfg.get("TOKEN", None),
-            instance=cfg.get("INSTANCE", None),
-        )
-    except Exception:
-        svc = QiskitRuntimeService()
-    name = cfg.get("BACKEND", None)
-    try:
-        return svc.backend(name) if name else None
-    except Exception:
-        return None
 
 
 def build_protein_hamiltonian(sequence: str, penalties: Tuple[int, int, int]) -> SparsePauliOp:
@@ -100,6 +63,7 @@ def parse_sequence_and_qubits_from_samples(df: pd.DataFrame) -> Tuple[Optional[s
     nq = int(df[candidates_nq[0]].iloc[0]) if candidates_nq else None
     L = int(df[candidates_L[0]].iloc[0]) if candidates_L else None
 
+    # fallback for headerless CSV written by the sampling pipeline
     if seq is None or nq is None or L is None:
         try:
             L = int(df.iloc[0, 0]) if L is None else L
@@ -111,7 +75,11 @@ def parse_sequence_and_qubits_from_samples(df: pd.DataFrame) -> Tuple[Optional[s
     return seq, nq, L
 
 
-def compute_depth_stats(sequence: str, backend, betas=BETA_LIST, seeds=SEEDS, reps=REPS) -> Tuple[Optional[float], Optional[int], Optional[int]]:
+def compute_depth_stats(sequence: str, betas=BETA_LIST, seeds=SEEDS, reps=REPS) -> Tuple[Optional[float], Optional[int], Optional[int]]:
+    """
+    Build circuits locally and transpile without a backend.
+    Returns (depth_mean, depth_max, num_qubits).
+    """
     H = build_protein_hamiltonian(sequence, PENALTY_PARAMS)
     n_qubits = getattr(H, "num_qubits", None)
     if n_qubits is None:
@@ -127,7 +95,7 @@ def compute_depth_stats(sequence: str, backend, betas=BETA_LIST, seeds=SEEDS, re
                 params=params, reps=reps, entanglement=ENTANGLEMENT
             )
             try:
-                qct = transpile(qc, backend=backend, optimization_level=1) if backend else transpile(qc, optimization_level=1)
+                qct = transpile(qc, optimization_level=1)
                 depths.append(int(qct.depth()))
             except Exception:
                 pass
@@ -141,6 +109,9 @@ def compute_depth_stats(sequence: str, backend, betas=BETA_LIST, seeds=SEEDS, re
 
 
 def compute_avg_time_per_shot(timing_df: pd.DataFrame) -> Tuple[Optional[float], int, float]:
+    """
+    Average over groups: seconds / (len(BETA_LIST)*SEEDS*REPS*SHOTS_PER_CIRCUIT)
+    """
     if timing_df.empty or "seconds" not in timing_df.columns:
         return None, 0, 0.0
 
@@ -159,7 +130,6 @@ def compute_avg_time_per_shot(timing_df: pd.DataFrame) -> Tuple[Optional[float],
 
 
 def main():
-    backend = get_backend()
     rows_out: List[Dict] = []
 
     if not ROOT.exists():
@@ -180,7 +150,7 @@ def main():
         effective_samples = int(len(sdf))
 
         avg_tps, groups, seconds_total = compute_avg_time_per_shot(tdf)
-        depth_mean, depth_max, nq_rebuild = compute_depth_stats(sequence, backend)
+        depth_mean, depth_max, nq_rebuild = compute_depth_stats(sequence)
         n_qubits = nq_rebuild if nq_rebuild is not None else nq_in_csv
 
         rows_out.append({
