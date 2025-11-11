@@ -103,7 +103,7 @@ def make_bar_compare(df: pd.DataFrame, out_png: Path, cap: float = 30000.0) -> N
     plt.grid(axis="y", linestyle="--", alpha=0.4)
     out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
+    plt.savefig(out_png, dpi=600)
     plt.close()
 
 
@@ -118,7 +118,7 @@ def make_scaling_plot(df: pd.DataFrame, out_png: Path, cap: float = 30000.0) -> 
     plt.grid(alpha=0.4, linestyle="--")
     out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig(out_png, dpi=300)
+    plt.savefig(out_png, dpi=600)
     plt.close()
 
 
