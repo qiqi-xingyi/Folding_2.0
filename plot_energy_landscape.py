@@ -178,7 +178,7 @@ def main():
     ax.set_title(f"3D Funnel (min-E = {Emin:.3f})")
     ax.set_xlabel("X (energy-dominant radial)")
     ax.set_ylabel("Y (hash-based angle)")
-    ax.set_zlabel("Height: energy + distance-to-min")
+    ax.set_zlabel("Height: energy")
     cbar = plt.colorbar(sc, ax=ax, shrink=0.75, pad=0.06)
     cbar.set_label("E_total")
     ax.view_init(elev=28, azim=38)
