@@ -6,25 +6,28 @@
 
 # -*- coding: utf-8 -*-
 """
-Plot QSAD vs VQE runtimes from result_summary/runtime_comparison.csv
-Style:
-  - QSAD color: #E47159
-  - VQE  color: #3D5C6F
-  - Narrow bars, large fonts
-  - Y-axis clipped at 30000 s
-"""
+IDE-ready plotting script for QSAD vs VQE runtime comparison.
 
-from __future__ import annotations
-import argparse
-from pathlib import Path
+Features:
+- Reads result_summary/runtime_comparison.csv
+- Plots QSAD (#E47159) vs VQE (#3D5C6F) total runtimes
+- Narrow bars, large fonts, publication style
+- Y-axis clipped at 30,000 seconds
+- Output: figs/runtime_qsad_vs_vqe.png
+"""
 
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
+from pathlib import Path
 
+# ====== File paths ======
+CSV_PATH = "result_summary/runtime_comparison.csv"
+OUT_PATH = "figs/runtime_qsad_vs_vqe.png"
 
+# ====== Style parameters ======
 QSAD_COLOR = "#E47159"
-VQE_COLOR  = "#3D5C6F"
+VQE_COLOR = "#3D5C6F"
 Y_CAP = 30000.0
 
 plt.rcParams.update({
@@ -39,40 +42,37 @@ plt.rcParams.update({
 
 
 def human_seconds(x, _pos):
-    # 12,345 style ticks
+    """Format y-axis ticks with comma separators."""
     return f"{int(x):,}"
 
 
-def load_data(csv_path: Path) -> pd.DataFrame:
+def load_data(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    # Ensure required columns exist
-    need = {"pdb_id", "qsad_time_total_s", "vqe_time_s"}
-    missing = need - set(df.columns)
+    required = {"pdb_id", "qsad_time_total_s", "vqe_time_s"}
+    missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"CSV missing columns: {sorted(missing)}")
-    # Keep original CSV order (no sort), clip values for plotting
+        raise ValueError(f"Missing columns in CSV: {missing}")
+
     df["qsad_plot_s"] = pd.to_numeric(df["qsad_time_total_s"], errors="coerce").clip(upper=Y_CAP)
-    df["vqe_plot_s"]  = pd.to_numeric(df["vqe_time_s"], errors="coerce").clip(upper=Y_CAP)
+    df["vqe_plot_s"] = pd.to_numeric(df["vqe_time_s"], errors="coerce").clip(upper=Y_CAP)
     return df
 
 
-def plot_runtime(df: pd.DataFrame, out_path: Path):
-    # Only rows where VQE runtime is available
-    sub = df.dropna(subset=["vqe_time_s"]).copy()
-    if sub.empty:
-        raise RuntimeError("No rows with VQE runtimes available to plot.")
+def plot_runtime(df: pd.DataFrame, out_path: str):
+    df = df.dropna(subset=["vqe_time_s"]).copy()
+    if df.empty:
+        raise RuntimeError("No rows with VQE runtime data available.")
 
-    x = range(len(sub))
-    labels = list(sub["pdb_id"])
+    x = range(len(df))
+    labels = list(df["pdb_id"])
 
-    fig = plt.figure(figsize=(12, 6))
-    ax = plt.gca()
-
+    fig, ax = plt.subplots(figsize=(12, 6))
     width = 0.28
-    ax.bar([i - width/2 for i in x], sub["qsad_plot_s"],
-           width=width, color=QSAD_COLOR, edgecolor="none", label="QSAD total (s)")
-    ax.bar([i + width/2 for i in x], sub["vqe_plot_s"],
-           width=width, color=VQE_COLOR, edgecolor="none", label="VQE total (s)")
+
+    ax.bar([i - width / 2 for i in x], df["qsad_plot_s"],
+           width=width, color=QSAD_COLOR, label="QSAD total (s)", edgecolor="none")
+    ax.bar([i + width / 2 for i in x], df["vqe_plot_s"],
+           width=width, color=VQE_COLOR, label="VQE total (s)", edgecolor="none")
 
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels, rotation=45, ha="right")
@@ -80,31 +80,16 @@ def plot_runtime(df: pd.DataFrame, out_path: Path):
     ax.set_title("QSAD vs VQE total runtime per fragment")
     ax.set_ylim(0, Y_CAP)
     ax.yaxis.set_major_formatter(FuncFormatter(human_seconds))
-
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
     ax.legend(frameon=False)
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
     plt.savefig(out_path, dpi=300)
     plt.close(fig)
-
-
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", type=Path, required=True,
-                    help="Path to result_summary/runtime_comparison.csv")
-    ap.add_argument("--out", type=Path, default=Path("figs/runtime_qsad_vs_vqe.png"),
-                    help="Output figure path (PNG)")
-    return ap.parse_args()
-
-
-def main():
-    args = parse_args()
-    df = load_data(args.csv)
-    plot_runtime(df, args.out)
-    print(f"[OK] Saved figure to: {args.out}")
+    print(f"[OK] Figure saved to: {out_path}")
 
 
 if __name__ == "__main__":
-    main()
+    df = load_data(CSV_PATH)
+    plot_runtime(df, OUT_PATH)
