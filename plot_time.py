@@ -68,7 +68,7 @@ def plot_runtime(df: pd.DataFrame, out_path: str):
     labels = list(df["pdb_id"])
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    width = 0.22
+    width = 0.24
 
     ax.bar([i - width / 2 for i in x], df["qsad_plot_s"],
            width=width, color=QSAD_COLOR, label="QSAD total (s)", edgecolor="none")
