@@ -31,13 +31,14 @@ VQE_COLOR = "#3D5C6F"
 Y_CAP = 30000.0
 
 plt.rcParams.update({
-    "font.size": 13,
-    "axes.titlesize": 16,
-    "axes.labelsize": 14,
-    "xtick.labelsize": 12,
-    "ytick.labelsize": 12,
-    "legend.fontsize": 12,
-    "figure.dpi": 150,
+    "font.family": "Arial",
+    "font.size": 16,
+    "axes.titlesize": 18,
+    "axes.labelsize": 16,
+    "xtick.labelsize": 14,
+    "ytick.labelsize": 14,
+    "legend.fontsize": 14,
+    "figure.dpi": 600,
 })
 
 
@@ -66,8 +67,8 @@ def plot_runtime(df: pd.DataFrame, out_path: str):
     x = range(len(df))
     labels = list(df["pdb_id"])
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    width = 0.28
+    fig, ax = plt.subplots(figsize=(8, 6))
+    width = 0.22
 
     ax.bar([i - width / 2 for i in x], df["qsad_plot_s"],
            width=width, color=QSAD_COLOR, label="QSAD total (s)", edgecolor="none")
