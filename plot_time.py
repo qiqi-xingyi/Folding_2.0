@@ -67,13 +67,13 @@ def plot_runtime(df: pd.DataFrame, out_path: str):
     x = range(len(df))
     labels = list(df["pdb_id"])
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    width = 0.24
+    fig, ax = plt.subplots(figsize=(8, 5))
+    width = 0.26
 
     ax.bar([i - width / 2 for i in x], df["qsad_plot_s"],
-           width=width, color=QSAD_COLOR, label="QSAD total (s)", edgecolor="none")
+           width=width, color=QSAD_COLOR, label="QSAD total (s)", edgecolor="black", linewidth=0.7)
     ax.bar([i + width / 2 for i in x], df["vqe_plot_s"],
-           width=width, color=VQE_COLOR, label="VQE total (s)", edgecolor="none")
+           width=width, color=VQE_COLOR, label="VQE total (s)", edgecolor="black", linewidth=0.7)
 
     ax.set_xticks(list(x))
     ax.set_xticklabels(labels, rotation=45, ha="right")
