@@ -94,7 +94,7 @@ def plot_training_curves(rows, out_dir: Path, epoch_limit: int = 500):
     monitor = np.array([r["monitor"] for r in rows])
 
     # Training loss
-    plt.figure(figsize=(6, 4))
+    plt.figure(figsize=(6, 2))
     plt.plot(epochs, train_loss, label="train_loss")
     plt.xlabel("epoch")
     plt.ylabel("loss")
@@ -105,7 +105,7 @@ def plot_training_curves(rows, out_dir: Path, epoch_limit: int = 500):
     plt.close()
 
     # Validation accuracy
-    plt.figure(figsize=(6, 4))
+    plt.figure(figsize=(6, 3))
     plt.plot(epochs, val_acc, label="val_acc", color="orange")
     plt.xlabel("epoch")
     plt.ylabel("accuracy")
@@ -116,7 +116,7 @@ def plot_training_curves(rows, out_dir: Path, epoch_limit: int = 500):
     plt.close()
 
     # Ranking metrics
-    plt.figure(figsize=(7, 5))
+    plt.figure(figsize=(7, 4))
     plt.plot(epochs, ndcg5, label="ndcg@5")
     plt.plot(epochs, ndcg10, label="ndcg@10")
     plt.plot(epochs, ndcg20, label="ndcg@20")
