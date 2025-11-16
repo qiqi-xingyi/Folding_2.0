@@ -93,6 +93,7 @@ def plot_training_curves(rows, out_dir: Path, epoch_limit: int = 500):
     spearman = np.array([r["val_spearman"] for r in rows])
     monitor = np.array([r["monitor"] for r in rows])
 
+
     # Training loss
     plt.figure(figsize=(6, 3))
     plt.plot(epochs, train_loss, label="train_loss")
