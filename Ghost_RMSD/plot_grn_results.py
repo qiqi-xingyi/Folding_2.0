@@ -11,6 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+
 # ====== Configurable paths ======
 BASE_DIR = Path(__file__).resolve().parent
 LOG_CSV = BASE_DIR / "checkpoints_full/train_log.csv"
