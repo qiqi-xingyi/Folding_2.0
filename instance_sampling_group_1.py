@@ -10,7 +10,6 @@ from typing import Dict, Any, List, Tuple
 from pathlib import Path
 import pandas as pd
 
-
 from qiskit.quantum_info import SparsePauliOp
 from qiskit_ibm_runtime import QiskitRuntimeService
 
