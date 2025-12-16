@@ -147,6 +147,5 @@ def main():
     logging.info("  - %s/cluster_out/", input_dir)
     logging.info("Done.")
 
-
 if __name__ == "__main__":
     main()
